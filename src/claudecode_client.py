@@ -417,12 +417,7 @@ class ClaudecodeClient:
 # 工厂函数
 # ============================================================================
 
-async def build_claudecode_client(**_ignored_legacy_kwargs: Any) -> ClaudecodeClient:
-    if _ignored_legacy_kwargs:
-        logger.debug(
-            "build_claudecode_client: 忽略以下旧的 HTTP 参数: %s",
-            sorted(_ignored_legacy_kwargs.keys()),
-        )
+async def build_claudecode_client() -> ClaudecodeClient:
     client = ClaudecodeClient()
     logger.info(
         "Claude Code 客户端 (claude_agent_sdk / SubprocessCLI) 就绪;"
@@ -542,10 +537,7 @@ class ClaudecodeAgentManager:
 # make_claudecode_execute_with_retry — 供 src.executor.execute_queries 注入
 # ============================================================================
 
-def make_claudecode_execute_with_retry(
-    client: ClaudecodeClient,
-    workspace_manager: Optional[ClaudecodeWorkspaceManager] = None,
-):
+def make_claudecode_execute_with_retry(client: ClaudecodeClient):
     """返回 claudecode 专用的 execute_with_retry 闭包 (简单重试,无 history fallback)。
 
     返回 `(result, evidence_incomplete)`,签名与 OpenClaw 对齐:
