@@ -464,12 +464,7 @@ class HermesClient:
 # 工厂函数
 # ============================================================================
 
-async def build_hermes_client(**_ignored_legacy_kwargs: Any) -> HermesClient:
-    if _ignored_legacy_kwargs:
-        logger.debug(
-            "build_hermes_client: 忽略以下旧的 HTTP 参数: %s",
-            sorted(_ignored_legacy_kwargs.keys()),
-        )
+async def build_hermes_client() -> HermesClient:
     client = HermesClient()
     logger.info(
         "Hermes 客户端 (进程内 AIAgent 模式) 就绪;模型与 provider 由 "
@@ -627,7 +622,7 @@ class HermesAgentManager:
 # make_hermes_execute_with_retry — 供 src.executor.execute_queries 注入
 # ============================================================================
 
-def make_hermes_execute_with_retry(client: HermesClient, workspace_manager: Optional[HermesWorkspaceManager] = None):
+def make_hermes_execute_with_retry(client: HermesClient):
     """返回 hermes 专用的 execute_with_retry 闭包 (简单重试,无 history fallback)。
 
     返回 `(result, evidence_incomplete)`,签名与 OpenClaw 对齐:

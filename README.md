@@ -2,21 +2,27 @@
 一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
 - OpenClaw
 - Hermes
+- Claude-Code
+- Openjiuwen
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
-| `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) |
+| `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) | `.openclaw/openclaw.json`全局兜底配置
 详见 `src/openclaw_client.py`。
 
 ## Hermes
 > from run_agent import AIAgent
-| `hermes_automation.py`   | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 |
+| `hermes_automation.py`   | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 | `.hermes/config.yaml`全局兜底配置
 详见 `src/hermes_client.py`。
 
-## ClaudeCode
+## Claude-Code
 > 基于 `claude_agent_sdk` 的进程内 harness — 直接复用官方 `ClaudeSDKClient` / `ClaudeAgentOptions` / `query()`等。
-| `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) |
+| `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) | `.claude/settings.json`全局兜底配置
 详见 `src/claudecode_client.py`。
+
+## Openjiuwen
+> `from openjiuwen.core` | openjiuwen 要显式在白名单里选 provider client（Anthropic / OpenAI / DeepSeek...），不在白名单的字符串兜底成 OpenAI。anthropic-messages 必须写 provider: "Anthropic"| `不支持TOOLS.md, 装配 rails/tools工具说明动态生成` | `~/.openjiuwen/openjiuwen.json `全局兜底
+详见 `src/openjiuwen_client.py`。
 
 ## 特性
 

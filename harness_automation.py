@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 from user_simulator import User_simulator
 
 from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
+from scripts.task_status import run_stats
 
 import time as _time
 _RUN_ID = _time.strftime("%Y%m%dT%H%M%S")
@@ -146,6 +147,9 @@ class HarnessAutomation:
         elif self.harness_type == "claude-code":
             from src.claudecode_client import ClaudecodeWorkspaceManager
             self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
+        elif self.harness_type == "openjiuwen":
+            from src.openjiuwen_client import OpenjiuwenWorkspaceManager
+            self.workspace_manager = OpenjiuwenWorkspaceManager("~/.openjiuwen/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -160,6 +164,8 @@ class HarnessAutomation:
             return await self._run_hermes()
         elif self.harness_type == "claude-code":
             return await self._run_claudecode()
+        elif self.harness_type == "openjiuwen":
+            return await self._run_openjiuwen()
         else:
             return await self._run_openclaw()
 
@@ -181,7 +187,6 @@ class HarnessAutomation:
 
         async with await build_openclaw_client(**reconnect_config) as client:
             self.client = client
-
             await self._setup_workspaces()
 
             agent_manager = OpenclawAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
@@ -214,22 +219,8 @@ class HarnessAutomation:
         )
         from src.executor import execute_queries
 
-        legacy_oc = {}
-        if self.config.gateway_ws_url:
-            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
-        if self.config.gateway_timeout is not None:
-            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
-        if self.config.api_key:
-            legacy_oc["api_key"] = "<redacted>"
-        if legacy_oc:
-            logger.info(
-                "[跨框架兼容] 接受到 openclaw 风格字段 %s; hermes 已全部忽略",
-                legacy_oc,
-            )
-
         async with await build_hermes_client() as client:
             self.client = client
-
             await self._setup_workspaces()
 
             agent_manager = HermesAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
@@ -244,7 +235,7 @@ class HarnessAutomation:
                 queries=self.config.queries,
                 client=client,
                 get_agent_fn=make_hermes_get_agent(client, workspace_manager=self.workspace_manager, agent_overrides=self.agent_overrides),
-                execute_with_retry_fn=make_hermes_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                execute_with_retry_fn=make_hermes_execute_with_retry(client),
                 simulator_factory=simulator_factory,
                 agent_system_prompts=agent_system_prompts,
                 max_turn=self.config.user_max_turn,
@@ -261,22 +252,8 @@ class HarnessAutomation:
         )
         from src.executor import execute_queries
 
-        legacy_oc = {}
-        if self.config.gateway_ws_url:
-            legacy_oc["gateway_ws_url"] = self.config.gateway_ws_url
-        if self.config.gateway_timeout is not None:
-            legacy_oc["gateway_timeout"] = self.config.gateway_timeout
-        if self.config.api_key:
-            legacy_oc["api_key"] = "<redacted>"
-        if legacy_oc:
-            logger.info(
-                "[跨框架兼容] 接受到 openclaw 风格字段 %s; claudecode 已全部忽略",
-                legacy_oc,
-            )
-
         async with await build_claudecode_client() as client:
             self.client = client
-
             await self._setup_workspaces()
 
             agent_manager = ClaudecodeAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
@@ -291,14 +268,45 @@ class HarnessAutomation:
                 queries=self.config.queries,
                 client=client,
                 get_agent_fn=make_claudecode_get_agent(client, workspace_manager=self.workspace_manager),
-                execute_with_retry_fn=make_claudecode_execute_with_retry(client, workspace_manager=self.workspace_manager),
+                execute_with_retry_fn=make_claudecode_execute_with_retry(client),
                 simulator_factory=simulator_factory,
                 agent_system_prompts=agent_system_prompts,
                 max_turn=self.config.user_max_turn,
                 run_id=_RUN_ID,
             )
             return results
+    
+    async def _run_openjiuwen(self) -> Dict[str, Any]:
+        from src.openjiuwen_client import (
+            OpenjiuwenAgentManager,
+            build_openjiuwen_client,
+            make_openjiuwen_execute_with_retry
+        )
+        from src.executor import execute_queries
 
+        async with await build_openjiuwen_client() as client:
+            self.client = client
+            await self._setup_workspaces()
+            agent_manager = OpenjiuwenAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+            
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=lambda name, session: client.get_agent(name, session),
+                execute_with_retry_fn=make_openjiuwen_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
+          
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
         logger.info("设置工作空间...")
@@ -348,6 +356,7 @@ async def main(
     config_file: Optional[str] = None,
     config_dict: Optional[Dict] = None,
     harness_type: Optional[str] = None,
+    traj_stats_result: Optional[str] = None
 ) -> None:
     """主入口函数"""
     setup_logger(config_file)
@@ -367,6 +376,11 @@ async def main(
     results = await automation.run()
 
     logger.info("所有任务执行完成!")
+
+    # 执行后处理：任务统计分析脚本
+    run_stats(config_file=config_file, traj_stats_result=traj_stats_result, harness_type=config.harness_type)
+    logger.info("任务统计已写入: %s", traj_stats_result)
+
     return results
 
 
@@ -392,8 +406,12 @@ if __name__ == "__main__":
         default=None,
         help="harness类型(不指定则使用配置文件中的 harness_type,缺省为 openclaw)"
     )
+    parser.add_argument(
+        "--traj_stats_result",
+        default="logs/traj_stats_result.json",
+        help="轨迹质量统计路径"
+    )
 
     args = parser.parse_args()
 
-    asyncio.run(main(config_file=args.config, harness_type=args.harness))
-
+    asyncio.run(main(config_file=args.config, harness_type=args.harness, traj_stats_result=args.traj_stats_result))
