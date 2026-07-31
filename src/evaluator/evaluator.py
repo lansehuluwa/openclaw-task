@@ -345,6 +345,10 @@ DEFAULT_EVAL_PROMPT = """你是一个独立、严格的任务评估专家(Evalua
 - 本纪律仅约束你(evaluator)自身的产物行为,不影响你对被测 agent 已有产物文件的读取与裁定。
 
 输出 inclination:任务确已达成→accept;尚有缺口/有矛盾→reject;证据不足以判定→uncertain。
+
+输出格式(硬性要求):你的最终回复**必须**是一个严格合法、可被 `json.loads` 直接解析的 JSON 对象,
+包裹在单个 ```json 代码块内。字段之间、数组元素之间**务必都带逗号**(漏逗号是最常见的致命错误),
+无尾随逗号、无注释、无代码块外多余文字。输出前请完整自检一遍 JSON 语法再给出。
 """
 
 # 每轮投喂的 user 消息模板:外置到 evaluator_user_prompt.md,按 `<!-- @section NAME -->`
@@ -513,9 +517,19 @@ class Evaluator:
         prompt_chars = len(prompt)  # token 代理量,供 eval_step 实验对比开销
 
         # 直接复用各 client 的 agent.execute:追加 schema 后缀 → 解析 JSON。
+        # 强约束严格合法 JSON:漏逗号是最常见的解析失败源(bug: score 识别失败),
+        # 在此把格式纪律顶到模型响应前的最后一屏,尽量在 evaluator 内一次产出合法 JSON,
+        # 不依赖下游的裸 LLM 修复/兜底(那只是最后防线,不应成为常态)。
         schema_suffix = (
-            f"\n\nRespond with valid JSON matching this schema:\n"
-            f"```json\n{json.dumps(_model_facing_schema(), indent=2)}\n```"
+            f"\n\n只输出**严格合法**的 JSON,匹配以下 schema:\n"
+            f"```json\n{json.dumps(_model_facing_schema(), indent=2)}\n```\n"
+            "格式铁律(务必逐条自检后再输出):\n"
+            "1. 只输出一个 JSON 对象,包裹在单个 ```json 代码块内;代码块外不得有任何解释、前后缀或多余文字。\n"
+            "2. **每个键值对、数组元素之间都必须有逗号**——这是最易出错处,输出前逐一核对,漏逗号会导致整份评估作废。\n"
+            "3. 不得有尾随逗号(最后一个元素/字段后不加逗号),不得写 JSON 注释,不得残留占位符。\n"
+            "4. 所有字符串用双引号;字符串内的双引号、换行等须正确转义。\n"
+            "5. 花括号 `{}` 与方括号 `[]` 必须成对闭合、层级正确。\n"
+            "输出前请在心里把 JSON 完整解析一遍,确认无语法错误再给出。"
         )
         try:
             resp = await eval_agent.execute(prompt + schema_suffix)
