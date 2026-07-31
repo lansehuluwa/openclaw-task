@@ -2,6 +2,7 @@
 一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
 - OpenClaw
 - Hermes
+- OpenCode
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -18,6 +19,11 @@
 | `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) |
 详见 `src/claudecode_client.py`。
 
+## OpenCode
+> 基于本地 OpenCode CLI 的轻量 harness，通过 `opencode run --format json` 执行任务并复用真实 session。
+| `opencode run --format json --dir <workspace>` | 需要 `opencode` CLI 已安装并已在 OpenCode 自身配置中设置可用服务 |
+详见 `src/opencode_client.py` 和 `configs/config_opencode.json`。模型、provider、endpoint 与凭证默认由 OpenCode 自身配置读取；后两个多轮示例的 User Simulator 会在内存中复用单个 JSON 配置里声明的 `@ai-sdk/openai-compatible` provider（`options.baseURL/apiKey` 支持 `{env:...}` 和 `{file:...}`），不需要向 `configs/user_proxy_model.json` 写入明文凭证。当前不解析 JSONC、多层配置合并或 OpenCode auth store；不满足上述条件时仍回退 `simulator_config`。
+
 ## 特性
 
 - ✅ **配置驱动** - 通过 JSON/YAML 配置定义所有任务
@@ -30,12 +36,25 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 使用 uv 准备 Python 3.12（推荐）
 
 ```bash
-# 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
-pip install -r requirements.txt
+# 安装并由 uv 管理最新的 Python 3.12
+uv python install 3.12
+
+# 在项目根目录创建 Python 3.12 虚拟环境 .venv
+uv venv --python 3.12
+
+# 将 requirements.txt 安装到项目 .venv
+uv pip install -r requirements.txt
+
+# 确认没有误用全局 Python / Pydantic 1.x
+uv run python -c "import sys, pydantic; print(sys.version); print('pydantic', pydantic.__version__)"
 ```
+
+`uv` 未安装时，请先参照 [uv 官方安装文档](https://docs.astral.sh/uv/getting-started/installation/) 安装。VSCode 中执行 `Python: Select Interpreter`，选择项目里的 `.venv`（Windows 为 `.venv\Scripts\python.exe`，macOS/Linux 为 `.venv/bin/python`）。
+
+如果不使用 `uv`，请确保当前解释器为 Python 3.12，并执行 `python -m pip install -r requirements.txt`。项目使用 Pydantic 2，不能使用仍安装 Pydantic 1.x 的解释器。
 
 ### 2. 确保 OpenClaw 运行
 
@@ -69,8 +88,11 @@ curl http://127.0.0.1:18789/health
 
 ```bash
 # 同一份 config.json,两个后端任挑
-python openclaw_automation.py --config configs/config_simple.json
-python hermes_automation.py   --config configs/config_simple.json
+uv run python openclaw_automation.py --config configs/config_simple.json
+uv run python hermes_automation.py   --config configs/config_simple.json
+
+# OpenCode 使用不含明文凭证的独立示例
+uv run python harness_automation.py --config configs/config_opencode.json
 ```
 
 ## 文档
@@ -109,9 +131,9 @@ python hermes_automation.py   --config configs/config_simple.json
 | `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
 | `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
 
-## 测试矩阵（3 Harness × 3 配置）
+## 测试矩阵（4 Harness × 3 配置）
 
-系统支持 3 种 harness 后端和 3 种配置模式的自由组合，共 9 种场景。核心配置文件为：
+系统支持 4 种 harness 后端和 3 种配置模式的自由组合，共 12 种场景。核心配置文件为：
 
 | 配置文件 | 模式 | `use_simulator` | `evaluate` |
 |----------|------|:-:|:-:|
@@ -119,13 +141,14 @@ python hermes_automation.py   --config configs/config_simple.json
 | `config_user.json` | + User Simulator | `true` | 无 |
 | `config_simple_eval.json` | + Evaluator | `true` | 有 |
 
-### 3 × 3 矩阵
+### 4 × 3 矩阵
 
 | | `config_simple.json` | `config_user.json` | `config_simple_eval.json` |
 |---|---|---|---|
 | **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **OpenCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 
 ### 运行方式
 
@@ -144,6 +167,11 @@ python harness_automation.py --harness hermes --config configs/config_simple_eva
 python harness_automation.py --harness claudecode --config configs/config_simple.json
 python harness_automation.py --harness claudecode --config configs/config_user.json
 python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+
+# OpenCode — CLI --harness 覆盖 config 内的 harness_type
+python harness_automation.py --harness opencode --config configs/config_simple.json
+python harness_automation.py --harness opencode --config configs/config_user.json
+python harness_automation.py --harness opencode --config configs/config_simple_eval.json
 ```
 
 ### 三种配置模式
@@ -161,16 +189,15 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+| **OpenCode** | OpenCode 自身配置；可选 CLI `--model` 覆盖 | `provider/model` | 覆盖时必填 |
 
-`user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
+`user_proxy_model.json` 可调配各 agent 的模型。OpenClaw 和 OpenCode 的模型覆盖需要 `provider/model`；OpenCode 的 endpoint 与凭证仍由 OpenCode 自身配置管理，不应在该文件新增明文凭证：
 
 ```json
 {
   "evaluator": {
     "model": "deepseek-v4-flash",
-    "provider": "api-proxy-deepseek",
-    "base_url": "http://...",
-    "api_key": "sk-..."
+    "provider": "api-proxy-deepseek"
   }
 }
 ```
