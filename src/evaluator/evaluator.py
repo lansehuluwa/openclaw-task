@@ -30,12 +30,46 @@ logger = logging.getLogger("harness_automation")
 _T = TypeVar("_T", bound=BaseModel)
 
 
+# 尾随逗号:`,` 紧跟(可含空白)`}`/`]`。合法 JSON 不允许,是模型最常见的可**无损**修复项。
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+
+
+def _loads_lenient(block: str) -> Any:
+    """先按原文 `json.loads`;失败仅做**无损平凡修复**(去尾随逗号)后重试一次。
+
+    只做确定性、无歧义的修复——**不猜补缺失的逗号/引号**(那类启发式会误伤字符串内容,
+    正是稳定性风险来源)。真正缺逗号等语法错交给上层的裸 LLM 修复兜底。
+    """
+    try:
+        return json.loads(block)
+    except json.JSONDecodeError:
+        # 仅在严格解析已失败时才改写,合法 JSON 绝不被触碰;改写后仍失败则照抛,交上层兜底。
+        return json.loads(_TRAILING_COMMA_RE.sub(r"\1", block))
+
+
 def _parse_json_as(text: str, model: Type[_T]) -> _T:
-    """从模型回复里抽 JSON 并校验:优先 ```json 围栏,其次裸 `{...}`。"""
+    """从模型回复里抽 JSON 并校验:优先 ```json 围栏,其次裸 `{...}`;含无损平凡修复。"""
     m = re.search(r"```json\s*([\s\S]*?)```", text) or re.search(r"\{[\s\S]*\}", text)
     if not m:
         raise ValueError(f"No JSON found in response: {text[:200]}")
-    return model.model_validate(json.loads(m.group(1) if m.lastindex else m.group(0)))
+    return model.model_validate(_loads_lenient(m.group(1) if m.lastindex else m.group(0)))
+
+
+def _fallback_eval_result() -> "EvaluationResult":
+    """解析彻底失败(平凡修复 + 裸 LLM 修复都无效)时的安全占位裁决。
+
+    目的:evaluator **确实产出了**评估、只是格式坏了——绝不能静默丢弃、让本轮反馈凭空消失
+    (bug: score 识别失败则反馈不回流)。这里合成一条不含任何具体错处/答案的通用提示回流
+    simulator,既保证"有评估必回流"、对话不中断,又零泄漏风险(不去 regex 抓破损 JSON 里的
+    字段,避免引入脆弱逻辑)。completion=None 表示"未评估",绝不因格式问题给 agent 判 0 分。
+    """
+    return EvaluationResult(
+        completion=None,
+        inclination="uncertain",
+        reason="本轮第三方评估的输出格式非法且自动修复未成功,未能得到结构化评估结果;"
+               "本轮无可用评估,请你自行依据对话内容与已知信息判断是否继续或结束。",
+        task_declared_complete=True,
+    )
 
 
 # 评估日志,仿 api_use.log,每行一条 JSON(供离线复核与校准)
@@ -378,6 +412,45 @@ class Evaluator:
         # 确定性评分聚合器:由 ScoringSpec 驱动 (∏gate)×Σ桶加权;completion 由它算出而非模型自报
         spec = config.scoring_spec or ScoringSpec.from_scoring(config.scoring, config.rubric_items())
         self.scorer = Scorer(spec)
+        # 可选的裸 LLM JSON 修复器(evaluator 输出非法 JSON 时兜底纠正);由 harness 注入
+        # simulator 的低成本 LLM(见 set_json_repair_fn),未注入则跳过该级修复。
+        self._json_repair_fn: Optional[Callable[[str], str]] = None
+
+    def set_json_repair_fn(self, fn: Optional[Callable[[str], str]]) -> None:
+        """注入裸 LLM JSON 修复器:入参为疑似非法 JSON 文本,返回修正后的文本。
+
+        由 harness 传入 simulator 的 `repair_json`——复用其 LLM 低成本纠正 evaluator 偶发的
+        非法 JSON,避免重跑昂贵的 evaluator agent。
+        """
+        self._json_repair_fn = fn
+
+    def _parse_with_repair(self, raw: str) -> Optional[EvaluationResult]:
+        """解析 evaluator 原始输出为 EvaluationResult,两级递进,全失败返回 None。
+
+        1) 平凡解析:`_parse_json_as`(含去围栏 + 无损去尾逗号);覆盖绝大多数情况。
+        2) 裸 LLM 修复一次:把原文交给注入的低成本 LLM 纠正语法后再解析——专治"漏逗号"
+           这类平凡修复不敢猜补的错(猜补会误伤字符串,故交给模型而非脆弱正则)。
+        两级都失败返回 None,由调用方合成安全占位反馈兜底。
+        """
+        try:
+            return _parse_json_as(raw, EvaluationResult)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("evaluator 输出平凡解析失败,尝试裸 LLM 修复: %s", e)
+
+        if self._json_repair_fn is None:
+            return None
+        try:
+            fixed = self._json_repair_fn(raw)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("裸 LLM 修复调用异常: %s", e)
+            return None
+        if not fixed or fixed == raw:
+            return None
+        try:
+            return _parse_json_as(fixed, EvaluationResult)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("裸 LLM 修复后仍解析失败: %s", e)
+            return None
 
     @classmethod
     def create(
@@ -439,18 +512,31 @@ class Evaluator:
         prompt = self._build_prompt(trajectory, rubric, window)
         prompt_chars = len(prompt)  # token 代理量,供 eval_step 实验对比开销
 
+        # 直接复用各 client 的 agent.execute:追加 schema 后缀 → 解析 JSON。
+        schema_suffix = (
+            f"\n\nRespond with valid JSON matching this schema:\n"
+            f"```json\n{json.dumps(_model_facing_schema(), indent=2)}\n```"
+        )
         try:
-            # 直接复用各 client 的 agent.execute:追加 schema 后缀 → 解析 JSON。
-            schema_suffix = (
-                f"\n\nRespond with valid JSON matching this schema:\n"
-                f"```json\n{json.dumps(_model_facing_schema(), indent=2)}\n```"
-            )
             resp = await eval_agent.execute(prompt + schema_suffix)
-            result = _parse_json_as(resp.content, EvaluationResult)
         except Exception as e:  # noqa: BLE001
-            logger.warning("evaluator 第 %d 轮评估失败: %s", current_turn.turn, e)
+            # agent 执行本身失败(网关/超时等):无输出可修,安全降级为 None(不阻断任务)。
+            logger.warning("evaluator 第 %d 轮执行失败: %s", current_turn.turn, e)
             self._log(trajectory, current_turn, None, error=str(e), window=window, prompt_chars=prompt_chars)
             return None
+
+        raw = resp.content or ""
+        result = self._parse_with_repair(raw)
+        if result is None:
+            # 平凡修复 + 裸 LLM 修复都失败 → 合成安全占位反馈回流(有评估必回流,绝不静默丢)。
+            # 无 rubric_checks → 跳过下方评分归一,completion 保持 None,直接落盘并返回。
+            logger.warning("evaluator 第 %d 轮输出无法解析为合法 JSON,回流安全占位反馈", current_turn.turn)
+            result = _fallback_eval_result()
+            self._log(
+                trajectory, current_turn, result,
+                error=f"parse_failed: {raw[:200]}", window=window, prompt_chars=prompt_chars,
+            )
+            return result
 
         # 确定性归一:无冻结 rubric、或本轮执行中(未交付)时,不评分——强制清空 rubric_checks
         # 且 completion=None(未评估,区别于"评估后判 0")。兜住模型自拟准则/未交付仍评分的幻觉。

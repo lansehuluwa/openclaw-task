@@ -239,6 +239,11 @@ async def execute_queries(
             eval_sys_prompt = (agent_system_prompts or {}).get(query.evaluate.agent_name)
         evaluator = create_evaluator(query.evaluate, client, run_id, base_session, eval_sys_prompt, get_agent_fn)
 
+        # 注入裸 LLM JSON 修复器:evaluator 偶发非法 JSON 时,复用 simulator 的 LLM 低成本纠正,
+        # 避免重跑昂贵的 evaluator agent(bug: score 识别失败则反馈不回流)。
+        if evaluator is not None and query_simulator is not None:
+            evaluator.set_json_repair_fn(query_simulator.repair_json)
+
         # 文件隔离:被测 agent 执行前,把本 query 的 oracle/rubrics 从磁盘删除(内容已在内存)。
         if evaluator is not None:
             _isolate_eval_files(query.evaluate)
