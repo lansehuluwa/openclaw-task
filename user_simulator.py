@@ -17,17 +17,6 @@ api_logger.addHandler(_handler)
 
 PROMPT_FILE = Path(__file__).parent / "system_prompt.md"
 
-# 裸 LLM JSON 修复器的 system 指令:只修语法、不改语义、只吐 JSON。
-# 供 evaluator 输出偶发非法 JSON 时,复用 simulator 自身的 LLM 低成本纠正
-# (比重跑 evaluator agent 便宜)。强约束"不得改动字段语义",避免修复顺带篡改评估内容。
-_JSON_REPAIR_SYSTEM = (
-    "你是一个严格的 JSON 修复器。用户会给你一段**可能不合法**的 JSON 文本"
-    "(常见问题:缺少逗号、多余逗号、缺引号或括号、夹带了 ```json 代码围栏或解释文字)。"
-    "你的唯一任务是把它修正为**严格合法**的 JSON。"
-    "铁律:只修语法,绝不改动、增删或臆测任何字段的取值与语义;"
-    "只输出修正后的 JSON 本身,不要任何解释、前后缀或 Markdown 代码块。"
-)
-
 
 class User_simulator:
     def __init__(
@@ -187,24 +176,6 @@ class User_simulator:
             return val.strip() if isinstance(val, str) else ""
 
         return _read("content") or _read("reasoning_content") or _read("reasoning")
-
-    def repair_json(self, broken_text: str) -> str:
-        """裸 LLM 单次调用,把疑似非法的 JSON 文本纠正为合法 JSON,只返回 JSON 文本。
-
-        复用 simulator 自身的 LLM(成本远低于重跑 evaluator agent);**不写入对话历史**
-        (self.messages 不变),纯工具调用。任何异常/空回复都退回原文,由调用方决定后续兜底。
-        """
-        messages = [
-            {"role": "system", "content": _JSON_REPAIR_SYSTEM},
-            {"role": "user", "content": broken_text},
-        ]
-        try:
-            resp = self.client.chat.completions.create(model=self.model, messages=messages)
-        except Exception as e:  # noqa: BLE001
-            logging.warning("repair_json LLM 调用失败,退回原文: %s", e)
-            return broken_text
-        fixed = self._extract_reply(resp)
-        return fixed or broken_text
 
     def reset(self):
         """清空对话历史，开始新一轮对话。"""
