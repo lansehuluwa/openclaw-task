@@ -267,6 +267,49 @@ def extract_tool_calls(messages: list[dict[str, Any]]) -> list[ToolCallEvidence]
     return calls
 
 
+def extract_tool_calls_openai(messages: list[dict[str, Any]]) -> list[ToolCallEvidence]:
+    """从 OpenAI/Hermes 原生消息解析工具调用证据(能力: trajectory-capture)。
+
+    Hermes 的 ``run_conversation`` 返回的 ``messages`` 用 OpenAI 原生结构(与 OpenClaw
+    的 ``toolCall``/``toolResult`` 块结构不同,故需独立解析,不能复用 extract_tool_calls):
+    - ``role=="assistant"`` 消息带 ``tool_calls: [{id, function:{name, arguments}}]``,
+      每个元素为一次调用(``arguments`` 是 **JSON 字符串**,由 ``_normalize_input`` 归一);
+    - ``role=="tool"`` 消息(带 ``tool_call_id`` / ``content``)为其返回。
+    按 ``tool_calls[].id`` ↔ ``tool_call_id`` 配对,保持调用出现顺序。
+
+    Hermes 无 gateway,``ExecutionResult.messages`` 是取工具证据的唯一来源;
+    ``HermesAgent._history`` 只存纯文本 user/assistant 对(无 tool_calls),故对整份
+    ``messages`` 解析天然只命中本轮工具调用,历史轮不贡献噪声。
+    """
+    # 1. 按 tool_call_id 索引所有 tool 结果消息
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool":
+            cid = m.get("tool_call_id")
+            if cid:
+                results_by_id[cid] = m
+    # 2. 顺序遍历 assistant 消息的 tool_calls,配对其结果
+    calls: list[ToolCallEvidence] = []
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            cid = tc.get("id") or tc.get("call_id")
+            name = fn.get("name") or tc.get("name") or ""
+            # OpenAI 的 arguments 是 JSON 字符串;_normalize_input 会 loads 回原生对象,
+            # 与落盘轨迹 input 同构(非结构化则保留原样)。
+            input_val = _normalize_input(fn.get("arguments") if fn else tc.get("arguments"))
+            output: Optional[str] = None
+            res = results_by_id.get(cid) if cid else None
+            if res is not None:
+                output = _block_text(res.get("content"))
+            calls.append(ToolCallEvidence(tool=name, input=input_val, output=output))
+    return calls
+
+
 def build_turn_record(
     turn: int,
     user_input: str,

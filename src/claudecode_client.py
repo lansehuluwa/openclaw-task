@@ -451,6 +451,10 @@ class ClaudecodeWorkspaceManager(BaseWorkspaceManager):
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
+    def get_skills_dst(self, workspace: Path) -> Path:
+        """Claude Code skills 需放在 .claude/skills 下才能被识别。"""
+        return workspace / ".claude" / "skills"
+
     def _copy_agent_configs(
         self,
         workspace: Path,

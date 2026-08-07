@@ -41,6 +41,10 @@ class BaseWorkspaceManager(ABC):
         """将 agent 配置文件(SOUL.md, USER.md 等)复制到 workspace,布局由子类决定"""
         ...
 
+    def get_skills_dst(self, workspace: Path) -> Path:
+        """skills 落盘目录,默认 workspace/skills,子类可覆盖布局"""
+        return workspace / "skills"
+
     def setup_agent_files(
         self,
         agent_name: str,
@@ -54,7 +58,7 @@ class BaseWorkspaceManager(ABC):
 
         logger.info("workspace: %s", workspace)
         if skill_base_dir and agent_skills:
-            logger.info("skills_dst: %s", workspace / "skills")
+            logger.info("skills_dst: %s", self.get_skills_dst(workspace))
         if content_root:
             logger.info(
                 "content_root -> workspace: %s -> %s",
@@ -66,8 +70,8 @@ class BaseWorkspaceManager(ABC):
             self._copy_agent_configs(workspace, config_files, agent_dir)
 
         if skill_base_dir and agent_skills:
-            skills_dst = workspace / "skills"
-            skills_dst.mkdir(exist_ok=True)
+            skills_dst = self.get_skills_dst(workspace)
+            skills_dst.mkdir(parents=True, exist_ok=True)
             for skill_path in agent_skills:
                 skill_name = Path(skill_path).name
                 src = Path(skill_base_dir) / skill_path

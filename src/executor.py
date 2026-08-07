@@ -25,7 +25,8 @@ from src.evaluator.trajectory import (
     ToolCallEvidence,
     build_turn_record, 
     capture_file_evidence,
-    extract_tool_calls
+    extract_tool_calls,
+    extract_tool_calls_openai,
 )
 
 logger = logging.getLogger("harness_automation")
@@ -116,10 +117,20 @@ async def process_turn(
     turn_tool_calls: Optional[List[ToolCallEvidence]] = None
     if agent is not None:
         try:
-            after_history = await _safe_chat_history(agent)
-            new_msgs = _new_messages_since(before_history or [], after_history)
-            turn_tool_calls = extract_tool_calls(new_msgs)
-            # 兜底但从 history 救回了工具证据 → 不再算"证据不完整"
+            gateway = getattr(getattr(agent, "_client", None), "gateway", None)
+            if gateway is None:
+                # Hermes/ClaudeCode:无 gateway,chat_history 恒空。工具证据只能从
+                # ExecutionResult.messages(run_conversation 返回的原生 OpenAI 消息)解析。
+                # _history 只存纯文本 user/assistant 对(无 tool_calls),故整份解析
+                # 天然只命中本轮工具调用,历史轮不贡献。
+                native_msgs = getattr(result, "messages", None) or []
+                turn_tool_calls = extract_tool_calls_openai(native_msgs)
+            else:
+                # OpenClaw:走网关 chat_history,按 timestamp 增量截取本轮新增消息。
+                after_history = await _safe_chat_history(agent)
+                new_msgs = _new_messages_since(before_history or [], after_history)
+                turn_tool_calls = extract_tool_calls(new_msgs)
+            # 兜底但从证据里救回了工具调用 → 不再算"证据不完整"
             if evidence_incomplete and turn_tool_calls:
                 evidence_incomplete = False
         except Exception as e:  # noqa: BLE001
