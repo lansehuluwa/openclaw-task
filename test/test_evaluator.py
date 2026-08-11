@@ -316,6 +316,132 @@ def test_completion_schema():
 
 
 # ============================================================================
+# Test 2f: 解析层鲁棒性(真实失败样本回归)
+# ============================================================================
+
+def test_parse_robustness():
+    print("=" * 60)
+    print("Test 2f: 解析层鲁棒性(裸引号/截断/散文/多围栏)")
+    print("=" * 60)
+
+    def valid(**overrides) -> dict:
+        base = {
+            "task_declared_complete": True,
+            "inclination": "accept",
+            "completion": 1.0,
+            "rubric_checks": [
+                {"rubric_id": "G1", "criterion": "x", "passed": 1},
+                {"rubric_id": "C1", "criterion": "y", "passed": 1},
+            ],
+            "reason": "Agent 完整回答了问题。",
+        }
+        base.update(overrides)
+        return base
+
+    # 场景 1:字符串值内嵌未转义 ASCII 双引号(实测 deepseek-v4-pro 输出,
+    # 曾致 Expecting ',' delimiter: line 8 column 47 (char 205))。
+    # 注意:必须手工拼坏 JSON——json.dumps 会把引号转义,样本就失真了。
+    reply_unescaped = (
+        '{"task_declared_complete": true, "inclination": "accept", '
+        '"completion": 1.0, '
+        '"rubric_checks": [{"rubric_id": "G1", "criterion": "x", "passed": 1, '
+        '"evidence": "Agent明确写出：\'基本思想：分治法。每次选择一个"基准"（pivot）\'"}], '
+        '"citations": ["Agent: \'基本思想：分治法。每次选择一个"基准"（pivot）\'"], '
+        '"reason": "Agent 完整回答了问题。"}'
+    )
+    assert '"基准"' in reply_unescaped  # 确认样本确实含裸引号
+    parsed = _parse_json_as(reply_unescaped, EvaluationResult)
+    assert parsed.inclination == "accept" and parsed.completion == 1.0
+    assert parsed.rubric_checks[0].evidence == \
+        "Agent明确写出：'基本思想：分治法。每次选择一个\"基准\"（pivot）'"
+    print("  未转义双引号 → 修复后解析成功 ✓")
+
+    # 场景 2:回复被截断(无闭合括号,实测: No JSON found)
+    reply_truncated = '{"task_declared_complete": true, "inclination": "accept", "rubric_checks": ['
+    parsed = _parse_json_as(reply_truncated, EvaluationResult)
+    assert parsed.inclination == "accept" and parsed.rubric_checks == []
+    print("  截断无闭合 → 补闭合后解析成功 ✓")
+
+    # 场景 3:JSON 前后有散文,且散文里含花括号(旧贪婪正则必挂)
+    prose = f"根据 rubric {{G1, G2}} 评估如下:\n{json.dumps(valid(), ensure_ascii=False)}\n补充说明见 {{附录A}}。"
+    parsed = _parse_json_as(prose, EvaluationResult)
+    assert parsed.inclination == "accept"
+    print("  前后散文含花括号 → 平衡配对提取成功 ✓")
+
+    # 场景 4:会话续接重放(先回显 schema 再输出答案)→ 取最新围栏块
+    schema_echo = "```json\n" + json.dumps(_model_facing_schema()) + "\n```"
+    answer = "```json\n" + json.dumps(valid(), ensure_ascii=False) + "\n```"
+    parsed = _parse_json_as(schema_echo + "\n" + answer, EvaluationResult)
+    assert parsed.inclination == "accept"
+    print("  多围栏(回显 schema + 答案)→ 取最新答案 ✓")
+
+    # 场景 5:纯 ``` 围栏(无 json 标签)+ 围栏内裸引号
+    fenced_plain = "```\n" + reply_unescaped + "\n```"
+    parsed = _parse_json_as(fenced_plain, EvaluationResult)
+    assert parsed.inclination == "accept"
+    print("  无标签围栏 + 裸引号 → 解析成功 ✓")
+
+    # 场景 6:完全不可解析 → 抛 ValueError(消息含原文片段)
+    try:
+        _parse_json_as("完全没有 JSON 的回复文本", EvaluationResult)
+        raise AssertionError("垃圾输入应抛 ValueError")
+    except ValueError as e:
+        assert "No JSON found" in str(e)
+    print("  垃圾输入 → 明确报错 ✓")
+
+    # 场景 7:截断 + 未转义引号同时发生(实测 deepseek-v4-flash 输出:
+    # 字符串中途被 max_tokens 截断,且串内嵌裸引号——单层修复都不够,
+    # 需截断修复与引号修复组合)
+    reply_combo = (
+        '```json\n'
+        '{\n  "inclination": "accept",\n  "completion": 1.0,\n'
+        '  "task_declared_complete": true,\n'
+        '  "reason": "Agent 在单轮内答复完整,无"还要继续"信号,判定已交付。'
+        '回答涵盖分治思想、pivot '
+    )
+    parsed = _parse_json_as(reply_combo, EvaluationResult)
+    assert parsed.inclination == "accept" and parsed.completion == 1.0
+    assert "还要继续" in parsed.reason, f"reason 应保留引号内容,实际 {parsed.reason!r}"
+    print("  截断 + 未转义引号(组合) → 组合修复后解析成功 ✓")
+
+    # 场景 8:完整输出但引号大量裸用,且字符串闭合引号后跟换行(实测样本:
+    # citations/evidence 里引 agent 原文,闭合引号后是 \n 而非逗号——旧启发式
+    # 只查紧邻字符,把闭合引号误转义导致状态失同步,全盘损坏)
+    reply_multi_quotes = (
+        '```json\n'
+        '{\n'
+        '  "task_declared_complete": true,\n'
+        '  "inclination": "accept",\n'
+        '  "completion": 1.0,\n'
+        '  "violations": [],\n'
+        '  "improvements": [\n'
+        '    "回答已完整覆盖要求。"\n'
+        '  ],\n'
+        '  "citations": [\n'
+        '    "Agent 明确给出核心思想："**核心思想**：分治法。每次选择"基准元素"（pivot）""\n'
+        '  ],\n'
+        '  "rubric_checks": [\n'
+        '    {\n'
+        '      "rubric_id": "G1",\n'
+        '      "criterion": "x",\n'
+        '      "passed": 1,\n'
+        '      "evidence": "Agent 明确写出"分治法"、"基准元素（pivot）""\n'
+        '    }\n'
+        '  ],\n'
+        '  "reason": "任务已交付,判定 accept。"\n'
+        '}\n'
+        '```'
+    )
+    parsed = _parse_json_as(reply_multi_quotes, EvaluationResult)
+    assert parsed.inclination == "accept" and parsed.completion == 1.0
+    assert parsed.rubric_checks[0].evidence == \
+        'Agent 明确写出"分治法"、"基准元素（pivot）"'
+    print("  多字符串闭合引号后跟换行(实测形态) → 修复后解析成功 ✓")
+
+    print("\n✅ 解析鲁棒性测试通过\n")
+
+
+# ============================================================================
 # Test 3: 调 API 测试端到端评估
 # ============================================================================
 
@@ -419,6 +545,84 @@ Respond with valid JSON matching this schema:
 
 
 # ============================================================================
+# Test 2e: 输出不可解析时自动修正重试一次
+# ============================================================================
+
+def test_eval_parse_retry():
+    print("=" * 60)
+    print("Test 2e: 输出不可解析 → 追加修正提示重试一次")
+    print("=" * 60)
+
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.evaluator.evaluator import Evaluator, EvaluateConfig
+    from src.evaluator.trajectory import Trajectory, TurnRecord
+
+    cfg = EvaluateConfig(agent_name="evaluator", to_simulator=True)
+    cfg.structured_rubrics = MOCK_RUBRICS
+    cfg.resolve_runtime()
+
+    traj = Trajectory(query="Q", agent_name="tester", turns=[])
+    turn = TurnRecord(turn=1, user_input="Q", agent_content="...")
+    traj.turns.append(turn)
+
+    valid = json.dumps({
+        "task_declared_complete": True,
+        "inclination": "accept",
+        "rubric_checks": [
+            {"rubric_id": "R1", "criterion": "x", "passed": 1},
+            {"rubric_id": "R2", "criterion": "y", "passed": 1},
+            {"rubric_id": "R3", "criterion": "z", "passed": 1},
+        ],
+    })
+    # 第一次:完全不可解析(纯文本,无任何 JSON);第二次:合法 JSON。
+    # 注意:截断 JSON 已被解析层直接修复(见 test_parse_robustness),不再触发重试。
+    unparseable = "根据证据评估,本回答满足全部要求,建议放行。"
+    fake_agent = SimpleNamespace(
+        session_key="k",
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(content=unparseable),
+                SimpleNamespace(content=valid),
+            ]
+        ),
+    )
+    client = SimpleNamespace(gateway=None)  # 短路 reset/push_review
+    evaluator = Evaluator(cfg, client, run_id="t", session_name="s",
+                          get_agent_fn=lambda a, s: fake_agent)
+
+    res = asyncio.run(evaluator.evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert res is not None, "重试后应返回评估结果"
+    assert fake_agent.execute.await_count == 2, (
+        f"应重试一次,实际调用 {fake_agent.execute.await_count} 次"
+    )
+    assert res.completion == 1.0, f"重试成功 completion 应为 1.0,实际 {res.completion!r}"
+    print("  第一次输出不可解析 → 修正提示重试成功 ✓")
+
+    # 连续两次都坏 → 仍安全降级返回 None(不抛、不阻断任务)
+    fake_bad = SimpleNamespace(
+        session_key="k",
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(content=unparseable),
+                SimpleNamespace(content=unparseable),
+            ]
+        ),
+    )
+    evaluator_bad = Evaluator(cfg, SimpleNamespace(gateway=None), run_id="t",
+                              session_name="s",
+                              get_agent_fn=lambda a, s: fake_bad)
+    res_bad = asyncio.run(evaluator_bad.evaluate_turn(traj, turn, rubric=MOCK_RUBRICS, window=1))
+    assert res_bad is None, "两次都失败应安全降级为 None"
+    assert fake_bad.execute.await_count == 2
+    print("  连续两次坏 JSON → 安全降级返回 None ✓")
+
+    print("\n✅ 解析重试测试通过\n")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -426,11 +630,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="测试 Evaluator")
     parser.add_argument("--proxy-config", default=DEFAULT_PROXY_CONFIG,
                         help=f"user_proxy_model.json 路径（默认: {DEFAULT_PROXY_CONFIG}）")
-    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "schema", "api"],
-                        help="测试模式: all/scorer/config/gating/skip/schema/api")
+    parser.add_argument("--mode", default="all", choices=["all", "scorer", "config", "gating", "skip", "schema", "parse", "retry", "api"],
+                        help="测试模式: all/scorer/config/gating/skip/schema/parse/retry/api")
     args = parser.parse_args()
 
-    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "schema", "api"]
+    modes = [args.mode] if args.mode != "all" else ["scorer", "config", "gating", "skip", "schema", "parse", "retry", "api"]
 
     if "scorer" in modes:
         test_scorer()
@@ -442,6 +646,10 @@ if __name__ == "__main__":
         test_skip_scoring()
     if "schema" in modes:
         test_completion_schema()
+    if "parse" in modes:
+        test_parse_robustness()
+    if "retry" in modes:
+        test_eval_parse_retry()
     if "api" in modes:
         test_api_evaluation(args.proxy_config)
 

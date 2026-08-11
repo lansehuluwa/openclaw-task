@@ -65,7 +65,13 @@ class BaseWorkspaceManager(ABC):
             )
 
         if agent_dir and config_files:
-            self._copy_agent_configs(workspace, config_files, agent_dir)
+            # 文档语义: agent_dir 是「包含各 agent 子目录」的根目录
+            # (agents/<agent_name>/SOUL.md);兼容旧配置:直接指向 agent 目录
+            # (agents/<agent_name>)时也接受,取其本身。
+            agent_source = Path(agent_dir).expanduser() / agent_name
+            if not agent_source.is_dir():
+                agent_source = Path(agent_dir).expanduser()
+            self._copy_agent_configs(workspace, config_files, str(agent_source))
 
         if skill_base_dir and agent_skills:
             skills_dst = workspace / self.skills_subdir

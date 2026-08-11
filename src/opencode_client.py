@@ -12,6 +12,7 @@ OpenCode 的 provider、endpoint 与凭证均由 OpenCode 自身配置读取；�
   load_opencode_simulator_config()
   OpenCodeWorkspaceManager / OpenCodeAgentManager
   make_opencode_execute_with_retry / make_opencode_get_agent
+  write_agent_opencode_config() / _agent_env_key_name()
 """
 
 from __future__ import annotations
@@ -55,6 +56,47 @@ def _resolve_config_references(value: Any, config_dir: Path) -> Optional[str]:
         return path.read_text(encoding="utf-8").strip()
 
     return _CONFIG_REFERENCE_RE.sub(replace, value).strip()
+
+
+def _resolve_bare_model(model_name: str) -> Optional[str]:
+    """把裸模型名解析为 ``provider/model``(对照 OpenCode 配置的 providers)。
+
+    实测 opencode 1.18.16 的 ``--model`` 不解析裸模型名(直接 UnknownError),
+    必须带 provider 前缀。此处复刻 simulator 的模型匹配逻辑:遍历 providers
+    的 ``models``(按 name/id),恰好一个 provider 声明该模型时解析成功;
+    零个/多个匹配返回 None(由调用方告警降级,绝不传裸名)。
+    """
+    configured_path = os.environ.get("OPENCODE_CONFIG")
+    try:
+        if configured_path:
+            data = json.loads(
+                Path(configured_path).expanduser().read_text(encoding="utf-8")
+            )
+        else:
+            p = Path.home() / ".config" / "opencode" / "opencode.json"
+            if not p.is_file():
+                return None
+            data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    providers = data.get("provider") or data.get("providers")
+    if not isinstance(providers, dict):
+        return None
+
+    matched = []
+    for provider, spec in providers.items():
+        if not isinstance(spec, dict):
+            continue
+        models = spec.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model_key, options in models.items():
+            model_id = options.get("id") if isinstance(options, dict) else None
+            if model_name in (model_key, model_id):
+                matched.append(provider)
+                break
+    return f"{matched[0]}/{model_name}" if len(matched) == 1 else None
 
 
 def load_opencode_simulator_config(
@@ -319,6 +361,7 @@ class OpenCodeAgent:
         system_prompt: Optional[str] = None,
         workspace: Optional[Path] = None,
         model_override: Optional[AgentModelConfig] = None,
+        per_agent_config: bool = False,
     ):
         self._client = client
         self.agent_name = agent_name
@@ -328,23 +371,35 @@ class OpenCodeAgent:
         self._system_prompt = system_prompt
         self._workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self._model_override = model_override
+        self._per_agent_config = per_agent_config
         self._opencode_session_id: Optional[str] = None
         self._process: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
 
     def _resolved_model(self) -> Optional[str]:
+        """解析后的模型串;裸模型名(无 provider)对照 OpenCode 配置补全 provider。
+
+        user_proxy_model.json 里只写 model 的覆盖默认可用:``--model`` 必须
+        provider/model 格式(实测裸名在 opencode 1.18.16 直接 UnknownError),
+        故裸名经 ``_resolve_bare_model`` 唯一匹配到 provider 后补全;
+        匹配不到/不唯一时告警并回退 OpenCode 自身配置。
+        """
         override = self._model_override
         if override is None or not override.resolved_model:
             return None
         model = override.resolved_model
-        if "/" not in model:
-            logger.warning(
-                "agent=%s 的 OpenCode 模型覆盖缺少 provider，已忽略裸模型名；"
-                "继续使用 OpenCode 自身配置",
-                self.agent_name,
-            )
-            return None
-        return model
+        if "/" in model:
+            return model
+        resolved = _resolve_bare_model(model)
+        if resolved is not None:
+            return resolved
+        logger.warning(
+            "agent=%s 的模型覆盖 %r 未能在 OpenCode 配置中唯一匹配到 provider，"
+            "已忽略；继续使用 OpenCode 自身配置",
+            self.agent_name,
+            model,
+        )
+        return None
 
     def _build_command(self) -> List[str]:
         command = [
@@ -366,6 +421,19 @@ class OpenCodeAgent:
         if self._system_prompt and self._opencode_session_id is None:
             return f"{self._system_prompt}\n\n{query}"
         return query
+
+    def _build_env(self) -> Optional[Dict[str, str]]:
+        """per-agent 显式配置开启且 override 带 api_key 时，注入对应环境变量。
+
+        与 ``write_agent_opencode_config`` 写入的 ``{env:...}`` 引用同名，
+        仅在该 agent 的子进程环境中注入，不落盘、不污染全局环境。
+        """
+        override = self._model_override
+        if not self._per_agent_config or override is None or not override.api_key:
+            return None
+        env = os.environ.copy()
+        env[_agent_env_key_name(self.agent_name)] = override.api_key
+        return env
 
     async def _stop_process(
         self, process: asyncio.subprocess.Process
@@ -437,6 +505,9 @@ class OpenCodeAgent:
                 subprocess_kwargs["creationflags"] = _CREATE_NO_WINDOW
             else:
                 subprocess_kwargs["start_new_session"] = True
+            subprocess_env = self._build_env()
+            if subprocess_env is not None:
+                subprocess_kwargs["env"] = subprocess_env
 
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -548,6 +619,7 @@ class OpenCodeClient:
         system_prompt: Optional[str] = None,
         workspace: Optional[Path] = None,
         model_override: Optional[AgentModelConfig] = None,
+        per_agent_config: bool = False,
     ) -> OpenCodeAgent:
         key = (agent_name, session_name)
         if key not in self._agents:
@@ -558,6 +630,7 @@ class OpenCodeClient:
                 system_prompt=system_prompt,
                 workspace=workspace,
                 model_override=model_override,
+                per_agent_config=per_agent_config,
             )
         return self._agents[key]
 
@@ -583,7 +656,8 @@ async def build_opencode_client(
 
     logger.info(
         "OpenCode 客户端 (本地 CLI / run --format json) 就绪；"
-        "模型、provider 与凭证由 OpenCode 自身配置决定。"
+        "模型名可经 simulator_config 按 agent 覆盖(裸模型名亦可)，"
+        "provider 与凭证由 OpenCode 自身配置决定。"
     )
     return OpenCodeClient(resolved_command)
 
@@ -599,6 +673,79 @@ def _normalize_agent_name(agent_name: str) -> str:
     normalized = re.sub(r"[^\w.-]+", "-", agent_name, flags=re.UNICODE)
     normalized = normalized.strip(".-")
     return normalized or "agent-default"
+
+
+def _agent_env_key_name(agent_name: str) -> str:
+    """agent_name → 运行时注入用的环境变量名 ``OPENCODE_<AGENT>_API_KEY``。
+
+    与 ``write_agent_opencode_config`` 生成的 ``{env:...}`` 引用严格同名。
+    """
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", agent_name).strip("_").upper()
+    return f"OPENCODE_{normalized or 'AGENT'}_API_KEY"
+
+
+def write_agent_opencode_config(
+    workspace: Path,
+    agent_name: str,
+    override: AgentModelConfig,
+) -> Optional[Path]:
+    """为单个 agent 写 ``<workspace>/.opencode/opencode.json``(per-agent 显式配置)。
+
+    - model: 取 ``override.resolved_model``(provider/model);缺 provider 时跳过并告警。
+    - provider.<name>.npm: 恒为 ``@ai-sdk/openai-compatible``。
+    - options.apiKey: 仅当 ``override.api_key`` 存在时写 ``{env:OPENCODE_<AGENT>_API_KEY}``
+      引用,不落明文,由运行时注入环境变量;缺失时不写(避免空 env 引用覆盖全局 key)。
+    - options.baseURL: 仅当 ``override.base_url`` 存在时写。
+    - 项目级 ``.opencode/opencode.json`` 与全局配置按 OpenCode 合并语义生效(同键覆盖、
+      其余继承),因此未显式给出的键(如 setCacheKey)自动回退全局。
+
+    返回写入的配置文件路径;无法确定 provider 等跳过场景返回 None。
+    """
+    model = override.resolved_model
+    if not model or "/" not in model:
+        logger.warning(
+            "agent=%s 的显式配置缺少 provider/model 格式，已跳过生成"
+            " .opencode/opencode.json，回退全局配置",
+            agent_name,
+        )
+        return None
+    provider, _, model_name = model.partition("/")
+
+    provider_block: Dict[str, Any] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "models": {model_name: {"name": model_name}},
+    }
+    options: Dict[str, Any] = {}
+    if override.api_key:
+        options["apiKey"] = f"{{env:{_agent_env_key_name(agent_name)}}}"
+    if override.base_url:
+        options["baseURL"] = override.base_url
+    if options:
+        provider_block["options"] = options
+
+    config_dir = workspace / ".opencode"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "model": model,
+                "provider": {provider: provider_block},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        "已为 agent=%s 生成显式配置: %s (model=%s)",
+        agent_name,
+        config_path,
+        model,
+    )
+    return config_path
 
 
 class OpenCodeWorkspaceManager(BaseWorkspaceManager):
@@ -621,7 +768,9 @@ class OpenCodeWorkspaceManager(BaseWorkspaceManager):
         workspace = self.base_dir / normalized
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "memories").mkdir(exist_ok=True)
-        (workspace / self.skills_subdir).mkdir(parents=True, exist_ok=True)
+        # skills 目录不在此无条件创建:仅当 agent 声明了技能时,
+        # 由 setup_agent_files 在复制技能前创建(无技能的 agent 不应有
+        # 一个空 skills 目录,那只会造成"技能应该在这里"的误导)。
         return workspace
 
     def _copy_agent_configs(
@@ -671,12 +820,14 @@ class OpenCodeAgentManager:
         client: OpenCodeClient,
         workspace_manager: OpenCodeWorkspaceManager,
         agent_overrides: Optional[Dict[str, AgentModelConfig]] = None,
+        per_agent_config: bool = False,
     ):
         self.client = client
         self.workspace_manager = workspace_manager
         self.agent_overrides: Dict[str, AgentModelConfig] = (
             agent_overrides or {}
         )
+        self.per_agent_config = per_agent_config
         self.client.workspace_manager = workspace_manager
 
     async def setup_agent(self, agent_config) -> None:
@@ -688,7 +839,17 @@ class OpenCodeAgentManager:
             logger.info("设置 Agent: %s | model=%s", agent_name, agent_config.model)
         else:
             logger.info("设置 Agent: %s", agent_name)
-        self.workspace_manager.get_agent_workspace(agent_name)
+        workspace = self.workspace_manager.get_agent_workspace(agent_name)
+        if self.per_agent_config and override is not None:
+            config_path = write_agent_opencode_config(
+                workspace, agent_name, override
+            )
+            if config_path is None:
+                logger.warning(
+                    "per_agent_config 开启但 agent=%s 无有效显式模型配置，"
+                    "回退全局配置",
+                    agent_name,
+                )
 
 
 def make_opencode_execute_with_retry(
@@ -748,6 +909,7 @@ def make_opencode_get_agent(
     workspace_manager: Optional[OpenCodeWorkspaceManager] = None,
     agent_overrides: Optional[Dict[str, AgentModelConfig]] = None,
     agent_system_prompts: Optional[Dict[str, str]] = None,
+    per_agent_config: bool = False,
 ):
     """返回 OpenCode 专用 get_agent_fn，注入 workspace 与模型覆盖。"""
     overrides = agent_overrides or {}
@@ -765,6 +927,7 @@ def make_opencode_get_agent(
             system_prompt=system_prompts.get(agent_name),
             workspace=workspace,
             model_override=overrides.get(agent_name),
+            per_agent_config=per_agent_config,
         )
 
     return get_agent

@@ -1,1 +1,32 @@
-__pycache__/*
+# Python 缓存
+__pycache__/
+*.pyc
+
+# IDE / 编辑器
+.idea/
+.vscode/
+
+# 运行日志
+logs/
+
+# 本地密钥配置(含真实 api_key,禁止提交;本地测试时把此文件内容
+# 覆盖到 user_proxy_model.json 即可,提交前记得还原为无密钥版)
+configs/user_proxy_model.local.json
+
+# 本地测试产物(不应提交)
+test/opencode_client_test.py
+scripts/mock_provider.py
+configs/test_per_agent_config.json
+configs/test_per_agent_mock_config.json
+configs/test_per_agent_mock_models.json
+configs/test_per_agent_models.json
+configs/config_manual_skill_test.json
+configs/config_skill_required_test.json
+skills/secret-checker/
+
+# configs/ 本地新增文件(不入库,保持仓库原样)
+configs/config_simple_eval_test.json
+configs/user_proxy_model_back.json
+
+# 本地备份目录(configs 多余文件的临时存放,不入库)
+local_backup/

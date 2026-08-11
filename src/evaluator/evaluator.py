@@ -47,12 +47,147 @@ def _loads_lenient(block: str) -> Any:
         return json.loads(_TRAILING_COMMA_RE.sub(r"\1", block))
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def _matching_brace(text: str, start: int) -> Optional[int]:
+    """从 ``text[start] == '{'`` 出发做字符串感知的花括号配对。
+
+    返回配对 ``'}`` 的下标;不闭合(截断)返回 None。字符串值内部的
+    ``{``/``}`` 不参与计数,与 json 语法一致。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+    return None
+
+
+def _json_candidates(text: str) -> List[str]:
+    """候选 JSON 文本,按「最新优先」排列(会话续接重放历史时,取模型最新输出)。
+
+    - 所有 ```json/``` 围栏块,倒序;
+    - 所有花括号配对区间,倒序(前置散文里的 ``{...}`` 解析失败会自然被跳过)。
+    """
+    candidates = [
+        m.group(1)
+        for m in _JSON_FENCE_RE.finditer(text)
+    ]
+    candidates += [
+        text[m.start(): end + 1]
+        for m in re.finditer(r"\{", text)
+        if (end := _matching_brace(text, m.start())) is not None
+    ]
+    candidates.reverse()
+    return candidates
+
+
+def _repair_unescaped_quotes(text: str) -> str:
+    """降级修复:把字符串值内部的裸 ASCII 双引号转义为 ``\\\"``。
+
+    启发式:字符串内遇到 ``"``,跳过其后的空白再看下一个有效字符——若仍是
+    内容字符,视为引号而非字符串终止符,转义之;若是分隔符(``,``/``:``/
+    ``}``/``]``)或结尾,则是字符串闭合引号,保留。LLM 常把答复原文(含
+    引号)原样引进 JSON 字符串值,产生这类坏输出(实测 evaluator 输出即如此)。
+    """
+    out: List[str] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch == '"':
+                j = i + 1
+                while j < len(text) and text[j] in " \t\r\n":
+                    j += 1
+                nxt = text[j] if j < len(text) else ""
+                # 结尾处的引号视为字符串终止符(截断点恰好落在引号上的场景)
+                if nxt in ",:}]" or nxt == "":
+                    in_string = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+    return "".join(out)
+
+
+# 截断修复的组合:(补引号数, 补 ] 数, 补 } 数),按常见截断点由浅入深。
+_TRUNCATION_COMBOS = (
+    (0, 0, 1),
+    (0, 1, 0),
+    (0, 1, 1),
+    (0, 2, 1),
+    (0, 2, 2),
+    (0, 3, 2),
+    (0, 3, 3),
+    (1, 0, 1),
+    (1, 1, 1),
+    (1, 1, 2),
+)
+
+
+def _repair_truncated(text: str) -> Iterator[str]:
+    """截断修复:给去掉围栏标记的全文补闭合字符,产出修复后的候选。"""
+    normalized = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    normalized = re.sub(r"```\s*$", "", normalized).rstrip(",").rstrip()
+    if not normalized or "{" not in normalized:
+        return
+    for quote, brackets, braces in _TRUNCATION_COMBOS:
+        yield normalized + '"' * quote + "]" * brackets + "}" * braces
+
+
 def _parse_json_as(text: str, model: Type[_T]) -> _T:
-    """从模型回复里抽 JSON 并校验:优先 ```json 围栏,其次裸 `{...}`;含无损平凡修复。"""
-    m = re.search(r"```json\s*([\s\S]*?)```", text) or re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        raise ValueError(f"No JSON found in response: {text[:200]}")
-    return model.model_validate(_loads_lenient(m.group(1) if m.lastindex else m.group(0)))
+    """从模型回复里抽 JSON 并校验,多层降级(越靠后越激进):
+
+    1. 围栏块与花括号配对区间,最新优先;
+    2. 候选内未转义双引号修复;
+    3. 全文截断补闭合(回复被 max_tokens 截断时)。
+
+    每层解析先严格 `json.loads`,失败仅做无损尾随逗号修复(`_loads_lenient`,
+    不猜补);全部失败才抛 ValueError(带原文片段,便于线上排查)。
+    """
+    for candidate in _json_candidates(text):
+        for attempt in (candidate, _repair_unescaped_quotes(candidate)):
+            try:
+                return model.model_validate(_loads_lenient(attempt))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    for attempt in _repair_truncated(text):
+        # 截断常与未转义引号同时出现(输出中途被 max_tokens 截断且串内嵌裸引号),
+        # 故每个截断修复候选也要再过一遍引号修复。
+        for candidate in (attempt, _repair_unescaped_quotes(attempt)):
+            try:
+                return model.model_validate(_loads_lenient(candidate))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    raise ValueError(f"No JSON found in response: {text[:200]}")
 
 
 # 评估日志,仿 api_use.log,每行一条 JSON(供离线复核与校准)
@@ -477,7 +612,31 @@ class Evaluator:
         )
         try:
             resp = await eval_agent.execute(prompt + schema_suffix)
-            result = _parse_json_as(resp.content, EvaluationResult)
+            # 客户端级失败(如 opencode CLI 报错)不会产生可解析内容,
+            # 直接把真实错误抛给外层统一记录,避免被误判为"输出不可解析"。
+            if not getattr(resp, "success", True):
+                raise RuntimeError(
+                    resp.error_message or "evaluator agent 执行失败"
+                )
+            try:
+                result = _parse_json_as(resp.content, EvaluationResult)
+            except Exception as first_error:  # noqa: BLE001
+                # LLM 偶发输出不可解析(截断/坏 JSON/多余文本):追加修正提示重试一次,
+                # 避免一次坏输出就丢掉整轮评估。client 级执行失败不会走到这里。
+                logger.warning(
+                    "evaluator 第 %d 轮输出解析失败(第 1 次): %s;"
+                    "原文片段: %r;追加修正提示重试",
+                    current_turn.turn,
+                    first_error,
+                    resp.content[:160],
+                )
+                resp = await eval_agent.execute(
+                    prompt
+                    + schema_suffix
+                    + "\n\n你上一条回复中没有可解析的 JSON。请只重新输出一个完整、"
+                    "符合上述 schema 的 JSON 对象,不要任何解释、不要截断。"
+                )
+                result = _parse_json_as(resp.content, EvaluationResult)
         except Exception as e:  # noqa: BLE001
             # 执行或解析失败:安全降级为 None(不阻断任务)。格式健壮性靠 schema_suffix/
             # DEFAULT_EVAL_PROMPT 的强约束 + _parse_json_as 的无损平凡修复(去围栏/尾逗号)从源头保证。

@@ -146,6 +146,19 @@ def warn_agent_model_conflict(
         )
 
 
+class OpenCodeConfig(BaseModel):
+    """OpenCode 专属配置。"""
+    model_config = {"extra": "ignore"}
+    per_agent_config: bool = Field(
+        False,
+        description=(
+            "为每个有显式模型配置的 agent 生成独立的 <workspace>/.opencode/opencode.json"
+            "(model/provider/baseURL,apiKey 用 {env:OPENCODE_<AGENT>_API_KEY} 引用);"
+            "关闭(默认)时全部回退 OpenCode 全局配置"
+        ),
+    )
+
+
 class QueryItem(BaseModel):
     """查询任务配置"""
     agent_name: str = Field(..., description="执行的 Agent 名称")
@@ -175,6 +188,11 @@ class AutomationConfig(BaseModel):
     user_profile: str = Field("", description="用户画像兜底文本,profile_file 不存在时使用")
     simulator_config: Optional[str] = Field(None, description="模型配置 JSON 绝对路径,顶层 model/api_key/base_url 用于 user_simulator;可选嵌套 {agent_name: {model,api_key,base_url}} 用于覆盖 harness agent")
     user_max_turn: int = Field(5, description="多轮对话最大轮次")
+
+    # OpenCode 专属配置
+    opencode: Optional[OpenCodeConfig] = Field(
+        None, description="OpenCode 专属配置(未配置时全部回退全局)"
+    )
 
     @field_validator("gateway_ws_url", mode="before")
     @classmethod

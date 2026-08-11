@@ -288,10 +288,16 @@ class HarnessAutomation:
 
             await self._setup_workspaces()
 
+            per_agent_config = bool(
+                self.config.opencode
+                and self.config.opencode.per_agent_config
+            )
+
             agent_manager = OpenCodeAgentManager(
                 client,
                 self.workspace_manager,
                 agent_overrides=self.agent_overrides,
+                per_agent_config=per_agent_config,
             )
             for agent_config in self.config.agents:
                 await agent_manager.setup_agent(agent_config)
@@ -323,6 +329,7 @@ class HarnessAutomation:
                     workspace_manager=self.workspace_manager,
                     agent_overrides=self.agent_overrides,
                     agent_system_prompts=agent_system_prompts,
+                    per_agent_config=per_agent_config,
                 ),
                 execute_with_retry_fn=make_opencode_execute_with_retry(
                     client,

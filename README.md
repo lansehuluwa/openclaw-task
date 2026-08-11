@@ -103,9 +103,11 @@ uv run python harness_automation.py --config configs/config_opencode.json
 
 ## 文档
 
-- **[快速开始](QUICKSTART.md)** - 5 分钟入门指南
-- **[设计文档](DESIGN.md)** - 详细的架构和 API 文档
-- **[示例代码](examples.py)** - 10 个实用示例
+- **[快速开始](docs/QUICKSTART.md)** - Python 3.12、uv 与各 Harness 的启动说明
+- **[项目完整工作流程](docs/PROJECT_WORKFLOW.md)** - 从配置、Workspace、Skills 到执行、评估和产物的完整链路
+- **[设计文档](docs/DESIGN.md)** - 架构和 API 文档
+- **[OpenCode CLI 测试报告](docs/OPENCODE_CLI_RESEARCH.md)** - CLI 能力、证据边界和任务隔离审计
+- **[OpenCode 接入方案对比](docs/OPENCODE_INTEGRATION_COMPARISON.md)** - CLI、attach、HTTP/SDK 与 ACP 方案对比
 
 ## 项目文件
 

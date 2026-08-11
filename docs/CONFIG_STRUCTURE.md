@@ -84,6 +84,29 @@ C:\Users\nianzu\.openclaw\
 }
 ```
 
+### opencode 配置（`harness_type: "opencode"`，可选）
+
+`opencode` 块提供 OpenCode 后端的专属配置；未配置时全部回退 OpenCode 全局配置
+（`~/.config/opencode/opencode.json`），与旧行为完全一致。
+
+```jsonc
+{
+  "harness_type": "opencode",
+  "opencode": {
+    "per_agent_config": false   // 默认关闭：为每个有显式配置的 agent 生成独立的
+                                // <workspace>/.opencode/opencode.json
+  },
+  "simulator_config": "/abs/path/model_config.json"
+}
+```
+
+- `per_agent_config`（默认 `false`）开启后，`simulator_config` 中出现的
+  `{agent_name: {model, provider, api_key, base_url}}` 会为该 agent 生成独立的
+  `.opencode/opencode.json`：model/provider 显式指定、apiKey 用
+  `{env:OPENCODE_<AGENT>_API_KEY}` 引用（不落明文，运行时注入子进程环境）、
+  baseURL 仅在携带时写入；未出现在 `simulator_config` 中的 agent 继续回退全局。
+- 生成文件与全局配置按 OpenCode 合并语义生效（同键覆盖、其余继承）。
+
 ### workspace_base 默认值
 
 在 `openclaw_automation.py` 中：
