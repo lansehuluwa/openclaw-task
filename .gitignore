@@ -30,3 +30,4 @@ configs/user_proxy_model_back.json
 
 # 本地备份目录(configs 多余文件的临时存放,不入库)
 local_backup/
+docs/PROJECT_WORKFLOW.md

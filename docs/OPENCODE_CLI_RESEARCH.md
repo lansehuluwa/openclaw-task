@@ -2,7 +2,7 @@
 
 > - 初版日期：2026-08-10 ｜ 精简日期：2026-08-11
 > - 本机 OpenCode 版本：`1.18.16` ｜ 平台：Windows / Python 3.12
-> - 关联文档：[项目完整工作流程](./PROJECT_WORKFLOW.md)、[接入方案对比](./OPENCODE_INTEGRATION_COMPARISON.md)
+> - 关联文档：[项目完整工作流程](./PROJECT_WORKFLOW.md)
 
 ## 0. 执行结论
 
