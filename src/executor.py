@@ -349,7 +349,19 @@ def _make_options(timeout: int):
     """构造 ExecutionOptions — 延迟导入避免循环依赖"""
     try:
         from openclaw_sdk import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
+        # openclaw-sdk 2.1.0: SDK 的 ExecutionOptions.timeout_seconds 被 pydantic 约束为 le=3600
+        opts = ExecutionOptions()
+        try:
+            object.__setattr__(opts, "timeout_seconds", int(timeout))
+        except Exception:
+            # 兜底: 极少数 pydantic 冻结模型下 __setattr__ 失败,退回子类重声明字段
+            from pydantic import Field
+            class _UnboundedExecutionOptions(ExecutionOptions):
+                timeout_seconds: int = Field(default=300, ge=1)
+            opts = _UnboundedExecutionOptions(timeout_seconds=int(timeout))
+        if timeout > 3600:
+            logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
+        return opts
     except ImportError:
         pass
     try:

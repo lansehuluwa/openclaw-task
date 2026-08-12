@@ -25,6 +25,10 @@ from websockets.asyncio.client import connect as ws_connect
 from openclaw_sdk import OpenClawClient, AgentConfig, ExecutionOptions
 from openclaw_sdk.core.config import ClientConfig
 from openclaw_sdk.core.exceptions import GatewayError
+try:
+    from openclaw_sdk.core.exceptions import AgentExecutionError
+except ImportError:  # pragma: no cover - SDK 版本差异兜底
+    AgentExecutionError = GatewayError
 from openclaw_sdk.core.types import ExecutionResult
 from openclaw_sdk.gateway.protocol import ProtocolGateway
 
@@ -690,6 +694,43 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 raise RuntimeError(
                     "Agent returned empty content and chat.history had no new assistant reply"
                 )
+            except AgentExecutionError as e:
+                # 网关侧 error/lifecycle 事件被 SDK 包成 AgentExecutionError 抛出,典型为:
+                #   - "LLM request timed out"                          (LLM 单请求超时)
+                #   - "session file changed while embedded prompt lock  (会话锁冲突)
+                #      was released"
+                msg = str(e).lower()
+                if "message or attachment required" in msg:
+                    # 确定性非法请求,重试救不了,快速失败(与下方连接分支一致)
+                    logger.error("网关拒绝非法请求(非连接问题),快速失败不重试: %s", e)
+                    raise
+                if "llm request timed out" in msg or "request timed out" in msg:
+                    reason = "LLM 请求超时"
+                elif "session file changed" in msg or "embedded prompt lock" in msg:
+                    reason = "会话锁冲突(session file changed while embedded prompt lock)"
+                else:
+                    reason = "agent 执行异常"
+                logger.warning(
+                    "%s (第 %d/%d 次): %s，先查 history 看旧 run 是否已完成",
+                    reason, attempt, max_attempts, e,
+                )
+                fallback_text = await history_fallback(before_history)
+                if fallback_text:
+                    logger.info("%s但 agent 已完成,从 history 获取到回复", reason)
+                    return ExecutionResult(
+                        success=True,
+                        content=fallback_text,
+                        stop_reason="complete",
+                    ), True
+                if attempt >= max_attempts:
+                    logger.error("%s且 history 无兜底,已达最大重试次数 %d", reason, max_attempts)
+                    raise
+                logger.warning(
+                    "history 也无结果,第 %d/%d 次重试前等待 %d 秒",
+                    attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS,
+                )
+                await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
+                continue
             except (GatewayError, asyncio.TimeoutError) as e:
                 # 确定性非法请求(如空消息体 → 网关 "message or attachment required")
                 # 不是连接异常:重试/history_fallback 都救不了,反而空转约一小时。

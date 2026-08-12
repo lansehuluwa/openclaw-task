@@ -50,6 +50,17 @@ pip install -r requirements.txt
 curl http://127.0.0.1:18789/health
 ```
 
+#### 超时与并发（网关侧配置，长任务/长推理必读）
+
+| 配置键 | 含义 | 建议值 |
+| --- | --- | --- |
+| `models.providers.<id>.timeoutSeconds` | **LLM 请求超时**——"多久没返回会 `LLM request timed out`"。挂在 provider 上，不是 `agents.defaults.llm`（该键会被网关拒：`Unrecognized key: "llm"`） | `600`（长推理可再调大） |
+| `agents.defaults.timeoutSeconds` | agent 单轮总超时（与 harness 下发的 timeoutMs 对齐） | `7200` |
+| `agents.defaults.subagents.runTimeoutSeconds` | 子 agent 运行超时 | `7200` |
+| `agents.defaults.maxConcurrent` | 同时运行的**顶层 agent** 数；调小可降低 `session file changed ... embedded prompt lock` 会话锁冲突。|
+| `agents.defaults.subagents.maxConcurrent` | 一个 agent 能并发拉起的**子 agent** 数；做 PPT 等靠子 agent 并发的任务用的是这个，**保持高值** | `8` |
+
+
 ### 3. 创建配置文件
 
 创建 `config.json`:
