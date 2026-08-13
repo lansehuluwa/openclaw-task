@@ -1,0 +1,61 @@
+{
+  "harness_type": "opencode",
+  "system": {
+    "platform": ["windows", "linux"],
+    "python": "3.11",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": "skills",
+    "agent_dir": "agents/audit_assistant",
+    "user_dir": null
+  },
+  "agents": [
+    {
+      "name": "audit-assistant",
+      "config": ["SOUL.md"],
+      "skills": [],
+      "system_prompt": null
+    },
+    {
+      "name": "multi-skill",
+      "config": [],
+      "skills": ["secret-checker", "agent-browser"],
+      "system_prompt": null
+    },
+    {
+      "name": "evaluator",
+      "config": [],
+      "skills": [],
+      "system_prompt": null
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "audit-assistant",
+      "text": "请根据你的 SOUL.md 规则回答：你的定位是什么？回答中必须原样包含短语『资深财务审计助手』和『审计师的智能协作伙伴』。",
+      "session_name": "md_test",
+      "timeout": 300,
+      "use_simulator": false
+    },
+    {
+      "agent_name": "multi-skill",
+      "text": "请加载 secret-checker 技能和 agent-browser 技能。第一行输出 secret-checker 技能的验证码；第二行用一句话说明 agent-browser 技能是什么。不要执行浏览器操作。",
+      "session_name": "multi_skill_eval",
+      "timeout": 600,
+      "use_simulator": true,
+      "evaluate": {
+        "agent_name": "evaluator",
+        "eval_step": 1,
+        "to_simulator": true,
+        "rubrics": [
+          "返回的验证码为 HARNESS-SKILL-OK-7F3A",
+          "没有声称实际执行浏览器操作",
+          "正确说明 agent-browser 技能的核心用途",
+          "回答使用中文，表述清晰"
+        ]
+      }
+    }
+  ],
+  "user_max_turn": 4
+}

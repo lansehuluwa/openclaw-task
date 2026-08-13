@@ -4,15 +4,16 @@
 - Hermes
 - Claude-Code
 - Openjiuwen
+- OpenCode
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
-| `openclaw_automation.py` | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) | `.openclaw/openclaw.json`全局兜底配置
+| `harness_automation.py`（默认） | OpenClaw 网关 | WebSocket → `openclaw-sdk` | 已有 OpenClaw 实例 (`ws://127.0.0.1:18789`) | `.openclaw/openclaw.json`全局兜底配置
 详见 `src/openclaw_client.py`。
 
 ## Hermes
 > from run_agent import AIAgent
-| `hermes_automation.py`   | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 | `.hermes/config.yaml`全局兜底配置
+| `harness_automation.py --harness hermes` | 进程内 AIAgent | 直接 `from run_agent import AIAgent` | 想跑 hermes-agent、无网关、最少依赖 | `.hermes/config.yaml`全局兜底配置
 详见 `src/hermes_client.py`。
 
 ## Claude-Code
@@ -23,6 +24,12 @@
 ## Openjiuwen
 > `from openjiuwen.core` | openjiuwen 要显式在白名单里选 provider client（Anthropic / OpenAI / DeepSeek...），不在白名单的字符串兜底成 OpenAI。anthropic-messages 必须写 provider: "Anthropic"| `不支持TOOLS.md, 装配 rails/tools工具说明动态生成` | `~/.openjiuwen/openjiuwen.json `全局兜底
 详见 `src/openjiuwen_client.py`。
+
+## OpenCode
+> 基于本地 `opencode run --format json` 子进程，每个 Agent 独立 workspace，
+> 通过 opencode 原生 `--agent` 指定技能对应的 Agent。
+| `opencode run --format json --dir <workspace> --agent <agent>` | 需要 `opencode` CLI 已安装，且 opencode.json 已配置好 provider/models/agents | 模型、baseURL、apiKey 全部由 opencode.json 管理；harness 不读 user_proxy_model.json |
+详见 [docs/OPENCODE_INTEGRATION.md](docs/OPENCODE_INTEGRATION.md)。
 
 ## 特性
 
@@ -75,49 +82,51 @@ curl http://127.0.0.1:18789/health
 
 ```bash
 # 同一份 config.json,两个后端任挑
-python openclaw_automation.py --config configs/config_simple.json
-python hermes_automation.py   --config configs/config_simple.json
+python harness_automation.py --config configs/config_simple.json
+python harness_automation.py --harness hermes --config configs/config_simple.json
 ```
 
 ## 文档
 
 - **[快速开始](QUICKSTART.md)** - 5 分钟入门指南
-- **[设计文档](DESIGN.md)** - 详细的架构和 API 文档
-- **[示例代码](examples.py)** - 10 个实用示例
+- **[文档索引](docs/README.md)** - 文档总览
+- **[OpenCode 集成说明](docs/OPENCODE_INTEGRATION.md)** - opencode.json / workspace / skill / session
+- **[设计文档](docs/DESIGN.md)** - 详细的架构和 API 文档
 
 ## 项目文件
 
 | 文件 | 说明 |
 |------|------|
-| `openclaw_automation.py` | 主程序 - 核心自动化引擎 |
-| `examples.py` | 示例集合 - 10 个使用示例 |
-| `test_automation.py` | 测试脚本 - 验证系统功能 |
-| `DESIGN.md` | 设计文档 - 完整的技术文档 |
-| `QUICKSTART.md` | 快速开始 - 入门指南 |
+| `harness_automation.py` | 主入口 - 统一执行所有 harness |
+| `src/` | 各 harness 客户端与执行器 |
+| `configs/` | 测试与示例配置 |
+| `skills/` | 技能目录 |
+| `test/` | 单元与端到端测试 |
 | `README.md` | 本文件 - 项目概述 |
+| `docs/` | 文档目录 |
 
 ### 配置示例
 
 | 文件 | 说明 |
 |------|------|
-| `example_config.json` | 完整示例 - 研究+写作流水线 |
-| `config_simple.json` | 简单示例 - 基础问答 |
-| `config_code_review.json` | 高级示例 - 代码审查流程 |
+| `config_simple.json` | 基础问答 |
+| `config_user.json` | 多轮 + User Simulator |
+| `config_simple_eval.json` | 多轮 + Simulator + Evaluator |
+| `config_opencode.json` | OpenCode 全特性测试（md 文件/多技能/评估） |
 
-### Hermes 端文件 (一体化新增)
+### 各 Harness 客户端
 
 | 文件 | 说明 |
 |------|------|
-| `hermes_automation.py` | 进程内 AIAgent 前端，与 `openclaw_automation.py` 等价 |
-| `hermes_utils/hermes_client.py` | `HermesClient` / `HermesAgent` 库封装 (lazy import `run_agent.AIAgent`) |
-| `hermes_utils/__init__.py` | 独立包,跟 `utils/` 并列;避免跟 hermes-agent 顶层 `utils.py` 重名 |
-| `docs/README_HERMES.md` | Hermes 后端的详细说明、配置示例、跨框架兼容字段 |
-| `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
-| `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
+| `src/openclaw_client.py` | OpenClaw 网关客户端 |
+| `src/hermes_client.py` | Hermes 进程内 AIAgent |
+| `src/claudecode_client.py` | Claude Code SDK 客户端 |
+| `src/openjiuwen_client.py` | OpenJiuwen 客户端 |
+| `src/opencode_client.py` | OpenCode CLI 子进程客户端 |
 
-## 测试矩阵（3 Harness × 3 配置）
+## 测试矩阵（5 Harness × 3 配置）
 
-系统支持 3 种 harness 后端和 3 种配置模式的自由组合，共 9 种场景。核心配置文件为：
+系统支持 5 种 harness 后端和 3 种配置模式的自由组合，共 15 种场景。核心配置文件为：
 
 | 配置文件 | 模式 | `use_simulator` | `evaluate` |
 |----------|------|:-:|:-:|
@@ -125,13 +134,15 @@ python hermes_automation.py   --config configs/config_simple.json
 | `config_user.json` | + User Simulator | `true` | 无 |
 | `config_simple_eval.json` | + Evaluator | `true` | 有 |
 
-### 3 × 3 矩阵
+### 5 × 3 矩阵
 
 | | `config_simple.json` | `config_user.json` | `config_simple_eval.json` |
 |---|---|---|---|
 | **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **Openjiuwen** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **OpenCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 
 ### 运行方式
 
@@ -150,6 +161,17 @@ python harness_automation.py --harness hermes --config configs/config_simple_eva
 python harness_automation.py --harness claudecode --config configs/config_simple.json
 python harness_automation.py --harness claudecode --config configs/config_user.json
 python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+
+# Openjiuwen
+python harness_automation.py --harness openjiuwen --config configs/config_simple.json
+python harness_automation.py --harness openjiuwen --config configs/config_user.json
+python harness_automation.py --harness openjiuwen --config configs/config_simple_eval.json
+
+# OpenCode（技能测试配置见 configs/config_opencode.json）
+python harness_automation.py --harness opencode --config configs/config_simple.json
+python harness_automation.py --harness opencode --config configs/config_user.json
+python harness_automation.py --harness opencode --config configs/config_simple_eval.json
+python harness_automation.py --harness opencode --config configs/config_opencode.json
 ```
 
 ### 三种配置模式
@@ -167,8 +189,9 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+| **OpenCode** | opencode.json 中的 `agent.<name>.model` / `--agent` | `provider/model` | 不需要 |
 
-`user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
+`user_proxy_model.json` 统一调配 OpenClaw/Hermes/ClaudeCode 的模型。OpenCode 不读取该文件，模型与凭证全部由 opencode.json 管理：
 
 ```json
 {
@@ -187,7 +210,7 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 
 ```python
 import asyncio
-from openclaw_automation import main
+from harness_automation import main
 
 # 从配置文件运行
 asyncio.run(main(config_file="config.json"))
@@ -196,7 +219,8 @@ asyncio.run(main(config_file="config.json"))
 ### 编程方式
 
 ```python
-from openclaw_automation import OpenClawAutomation, AutomationConfig, AgentConfigItem, QueryItem
+from harness_automation import HarnessAutomation
+from src.config import AutomationConfig, AgentConfigItem, QueryItem
 
 config = AutomationConfig(
     agents=[
@@ -213,7 +237,7 @@ config = AutomationConfig(
     ]
 )
 
-automation = OpenClawAutomation(config)
+automation = HarnessAutomation(config)
 results = await automation.run()
 ```
 
@@ -237,24 +261,19 @@ results = await automation.run()
 ## 运行示例
 
 ```bash
-# 查看所有示例
-python examples.py
+# OpenClaw 默认
+python harness_automation.py --config configs/config_simple.json
 
-# 运行特定示例
-python examples.py 1   # 简单使用
-python examples.py 4   # 内容创作流水线
-python examples.py 9   # 并行执行
+# 指定 harness
+python harness_automation.py --harness hermes --config configs/config_simple.json
+python harness_automation.py --harness opencode --config configs/config_opencode.json
 ```
 
 ## 运行测试
 
 ```bash
 # 运行所有测试
-python test_automation.py
-
-# 运行特定测试
-python test_automation.py "配置模型"
-python test_automation.py "工作空间"
+python -m unittest discover -s test -p '*_test.py' -v
 ```
 
 ## 配置结构
@@ -739,7 +758,7 @@ logging.basicConfig(level=logging.DEBUG)
 ### 运行测试
 
 ```bash
-python test_automation.py
+python -m unittest discover -s test -p '*_test.py' -v
 ```
 
 ### 贡献
@@ -828,8 +847,8 @@ MIT License
 如有问题，请：
 
 1. 查看 `DESIGN.md` 中的故障排查部分
-2. 运行 `python test_automation.py` 检查环境
-3. 查看示例代码 `examples.py`
+2. 运行 `python -m unittest discover -s test -p '*_test.py' -v` 检查环境
+3. 查看 `docs/README.md` 文档索引
 4. 提交 Issue
 
 ---

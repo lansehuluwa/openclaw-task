@@ -1,1 +1,18 @@
-__pycache__/*
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+
+# 本地文件（不提交）
+local_backup/
+logs/
+*.log
+docs/PROJECT_WORKFLOW.md
+scripts/mock_provider.py
+
+# 本地测试文件（不提交）
+test/opencode_client_test.py
+skills/secret-checker/
