@@ -20,7 +20,15 @@ HarnessAutomation
 
 - prompt 通过 stdin 传入，不走 shell 字符串拼接；
 - 模型、provider、baseURL、apiKey 全部由 opencode.json 管理；
-- harness 不读取 `configs/user_proxy_model.json`，也不向命令行传凭证。
+- harness 不读取 `configs/user_proxy_model.json`，也不向命令行传凭证；
+- 失败重试 5 次、间隔 60s，与其他 harness（hermes / claude-code /
+  openjiuwen）一致；重试时用 `--session <sessionID>` 续接同一会话；
+- `agents[].name` 必须存在于 opencode.json 的 `agent` 段：setup 阶段会
+  硬校验，避免 opencode CLI 对未知 `--agent` 静默回退 default agent
+  （回退后模型/权限全错、进程仍以退出码 0 跑完，测评结果失真）；
+- `step_finish.reason` 映射为 `stop_reason`：`stop` → `complete`，其余
+  （如达到 maxTokens 的 `length`）原样透传，该轮会被标为「证据可能
+  不完整」，与其它 harness 的 `evidence_incomplete` 语义对齐。
 
 ## 2. opencode.json 配置
 

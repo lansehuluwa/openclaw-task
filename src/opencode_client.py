@@ -29,8 +29,8 @@ from src.workspace import BaseWorkspaceManager
 
 logger = logging.getLogger("harness_automation")
 
-EXECUTION_MAX_ATTEMPTS = 3
-EXECUTION_RETRY_WAIT_SECONDS = 5
+EXECUTION_MAX_ATTEMPTS = 5
+EXECUTION_RETRY_WAIT_SECONDS = 60
 
 _CREATE_NO_WINDOW = 0x08000000
 _ERROR_TEXT_LIMIT = 4000
@@ -41,10 +41,6 @@ class OpenCodeError(RuntimeError):
     """OpenCode CLI 调用失败。"""
 
 
-class _OpenCodeNonRetryableError(OpenCodeError):
-    """本轮可能已产生副作用，不得自动重试。"""
-
-
 @dataclass
 class ExecutionResult:
     success: bool = True
@@ -52,6 +48,18 @@ class ExecutionResult:
     stop_reason: Optional[str] = "complete"
     error_message: Optional[str] = None
     usage: Optional[Dict[str, Any]] = field(default=None)
+
+    def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
+        data = {
+            "success": self.success,
+            "content": self.content,
+            "stop_reason": self.stop_reason,
+            "error_message": self.error_message,
+            "usage": self.usage,
+        }
+        if update:
+            data.update(update)
+        return ExecutionResult(**data)
 
 
 @dataclass
@@ -82,10 +90,31 @@ def _event_error_message(event: Dict[str, Any]) -> Optional[str]:
     if value is None and isinstance(part, dict):
         value = part.get("error")
     if isinstance(value, dict):
-        value = value.get("message") or value.get("name")
+        # v1.18 实测:error 事件形如
+        # {"error": {"name": "UnknownError",
+        #            "data": {"message": "Unexpected server error...", "ref": "err_xxx"}}}
+        # 可读信息在 data.message,依次回退顶层 message/name。
+        data = value.get("data")
+        data = data if isinstance(data, dict) else {}
+        value = (
+            data.get("message")
+            or value.get("message")
+            or value.get("name")
+        )
+        ref = data.get("ref")
+        if ref:
+            value = f"{value} (ref={ref})"
     if value is None:
         return None
     return _redact_error_text(str(value))
+
+
+_AGENT_FALLBACK_RE = re.compile(r"agent\s+\S+\s+not\s+found", re.IGNORECASE)
+
+
+def _detect_agent_fallback(stderr: str) -> bool:
+    """opencode run --agent 未知名时仅在 stderr 警告并静默回退 default agent。"""
+    return bool(_AGENT_FALLBACK_RE.search(stderr))
 
 
 def _parse_run_output(stdout: str) -> Dict[str, Any]:
@@ -94,6 +123,7 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
     text_order: List[str] = []
     text_by_part: Dict[str, str] = {}
     usage: Optional[Dict[str, Any]] = None
+    stop_reason: Optional[str] = None
     errors: List[str] = []
     valid_events = 0
 
@@ -131,6 +161,12 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
                 "tokens": tokens if isinstance(tokens, dict) else {},
                 "cost": part.get("cost"),
             }
+            # v1.18 实测 step-finish part.reason:正常结束为 "stop";
+            # 其余(如 "length" 达到 maxTokens)原样透传,供下游把
+            # 非 complete 的轮次标为"证据可能不完整"(对齐其他 harness)。
+            reason = part.get("reason")
+            if isinstance(reason, str) and reason:
+                stop_reason = "complete" if reason == "stop" else reason
         elif event_type == "error":
             errors.append(
                 _event_error_message(event) or "OpenCode 返回 error 事件"
@@ -143,6 +179,7 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
         "content": "".join(text_by_part[key] for key in text_order).strip(),
         "session_id": session_id,
         "usage": usage,
+        "stop_reason": stop_reason or "complete",
         "error": "; ".join(errors) if errors else None,
     }
 
@@ -328,6 +365,13 @@ class OpenCodeAgent:
             self._opencode_session_id = parsed["session_id"]
 
         error = parsed["error"]
+        if _detect_agent_fallback(stderr):
+            fallback_error = (
+                f"OpenCode CLI 提示 agent '{self.agent_name}' 不存在并回退 "
+                "default agent(结果不代表该 agent);请核对 opencode.json 的 "
+                "agent 段"
+            )
+            error = "; ".join(x for x in (error, fallback_error) if x)
         if process.returncode != 0:
             error = error or stderr or (
                 f"OpenCode 进程退出码为 {process.returncode}"
@@ -346,7 +390,7 @@ class OpenCodeAgent:
         return ExecutionResult(
             success=True,
             content=parsed["content"],
-            stop_reason="complete",
+            stop_reason=parsed["stop_reason"],
             usage=parsed["usage"],
         )
 
@@ -496,11 +540,52 @@ class OpenCodeAgentManager:
             logger.info("设置 Agent: %s | model=%s", agent_name, agent_config.model)
         else:
             logger.info("设置 Agent: %s", agent_name)
+        self._validate_agent_name(agent_name)
         self.workspace_manager.get_agent_workspace(agent_name)
+
+    @staticmethod
+    def _validate_agent_name(agent_name: str) -> None:
+        """校验 --agent 名已定义,否则 CLI 会静默回退 default agent。
+
+        opencode v1.18 实测:未知 agent 只在 stderr 打一行警告
+        ``agent "x" not found. Falling back to default agent``,进程仍以
+        退出码 0 跑完 —— 模型/权限全错,测评结果完全失真。因此这里
+        读 opencode.json 提前硬失败(读不到配置才降级为仅告警)。
+        """
+        config_path = _opencode_config_path()
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "无法读取 %s,跳过 agent 存在性校验: %s", config_path, exc
+            )
+            return
+        agents_cfg = data.get("agent") if isinstance(data, dict) else None
+        agents_cfg = agents_cfg if isinstance(agents_cfg, dict) else {}
+        if agent_name not in agents_cfg:
+            available = sorted(agents_cfg) or ["(空)"]
+            raise OpenCodeError(
+                f"agent '{agent_name}' 未在 {config_path} 的 agent 段中定义;"
+                f"可用 agent: {available}。opencode CLI 对未知 --agent 会静默"
+                "回退 default agent,为防止测评对象错配,请先在 opencode.json "
+                "中定义该 agent(或修正 harness 配置里的 agents[].name)。"
+            )
 
 
 def make_opencode_execute_with_retry(client: OpenCodeClient):
-    """返回 OpenCode 专用 execute_with_retry，签名与 Hermes 对齐。"""
+    """返回 OpenCode 专用 execute_with_retry，行为与 Hermes/ClaudeCode 对齐。
+
+    返回 `(result, evidence_incomplete)`,签名与 OpenClaw 对齐:
+    - 正常返回 → `(result, False)`;
+    - stop_reason 非 "complete"(如模型达到 maxTokens 的 "length")→
+      `(result, True)`,提示下游 evaluator:本轮回复可能被截断,证据缺失
+      不得当负面证据(D5)。
+
+    任何失败都按 EXECUTION_MAX_ATTEMPTS / EXECUTION_RETRY_WAIT_SECONDS
+    重试。opencode 子进程即使失败也会产出 sessionID,重试时自动
+    ``--session <id>`` 续接同一会话,与其他 harness 在会话内重发同一条
+    查询的行为一致(瞬时模型错误/超时均可恢复,不再一次失败即终止)。
+    """
 
     async def execute_with_retry(agent, query_text: str, options):
         last_exc: Optional[BaseException] = None
@@ -520,15 +605,7 @@ def make_opencode_execute_with_retry(client: OpenCodeClient):
                     )
                 else:
                     message = "OpenCode returned empty content"
-
-                if (
-                    result.stop_reason == "timeout"
-                    or getattr(agent, "_opencode_session_id", None)
-                ):
-                    raise _OpenCodeNonRetryableError(message)
                 raise OpenCodeError(message)
-            except _OpenCodeNonRetryableError:
-                raise
             except (OpenCodeError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 if attempt >= EXECUTION_MAX_ATTEMPTS:
@@ -592,6 +669,16 @@ def _resolve_config_ref(value: Any, config_dir: Path) -> Optional[str]:
     return _CONFIG_REF_RE.sub(replace, value).strip() or None
 
 
+def _opencode_config_path() -> Path:
+    """opencode.json 路径:OPENCODE_CONFIG 优先,否则全局默认位置。"""
+    configured_path = os.environ.get("OPENCODE_CONFIG")
+    return (
+        Path(configured_path).expanduser()
+        if configured_path
+        else Path.home() / ".config" / "opencode" / "opencode.json"
+    )
+
+
 def load_opencode_simulator_config(
     preferred_model: Optional[str] = None,
 ) -> Optional[AgentModelConfig]:
@@ -600,12 +687,7 @@ def load_opencode_simulator_config(
     Agent 本身完全由 opencode.json 管理；这里只解决 Simulator 复用同一
     provider 的凭证/endpoint 问题。读取失败时返回 None，由上层回退。
     """
-    configured_path = os.environ.get("OPENCODE_CONFIG")
-    config_path = (
-        Path(configured_path).expanduser()
-        if configured_path
-        else Path.home() / ".config" / "opencode" / "opencode.json"
-    )
+    config_path = _opencode_config_path()
     try:
         data = json.loads(config_path.read_text(encoding="utf-8"))
         config_dir = config_path.parent
