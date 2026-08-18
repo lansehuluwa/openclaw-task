@@ -379,4 +379,9 @@ def _make_options(timeout: int):
         return ExecutionOptions(timeout_seconds=timeout)
     except ImportError:
         pass
+    try:
+        from src.opencode_client import ExecutionOptions
+        return ExecutionOptions(timeout_seconds=timeout)
+    except ImportError:
+        pass
     return None

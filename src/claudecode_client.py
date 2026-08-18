@@ -30,7 +30,8 @@ from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
 logger = logging.getLogger("harness_automation")
-
+# SDK 对 `claude` CLI 子进程的 stdout 做了 单条 JSON 消息 1 MiB 上限
+_claude_code_max_buffer_size = 32 * 1024 * 1024  # 32 MiB
 
 # ============================================================================
 # 异常类型
@@ -136,6 +137,7 @@ class ClaudecodeAgent:
             "preset": "claude_code",
             "append": self._system_prompt or ""
         }
+        kwargs["max_buffer_size"] = _claude_code_max_buffer_size
         if self._model:
             kwargs["model"] = self._model
         if self._cwd is not None:
@@ -449,6 +451,7 @@ class ClaudecodeWorkspaceManager(BaseWorkspaceManager):
             base_name = self.base_dir.name
             workspace = parent / f"{base_name}-{agent_name}"
         workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / ".claude" / "skills").mkdir(parents=True, exist_ok=True)
         return workspace
 
     def get_skills_dst(self, workspace: Path) -> Path:

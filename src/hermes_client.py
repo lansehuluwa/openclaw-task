@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from run_agent import AIAgent as _AIAgent  # noqa: F401
 
-from src.workspace import BaseWorkspaceManager
+from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
 logger = logging.getLogger("harness_automation")
@@ -588,7 +588,7 @@ class HermesWorkspaceManager(BaseWorkspaceManager):
                 if src.exists():
                     dst = workspace / _PERSONA_DST.get(config_file, Path(config_file))
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                    copy_path(src, dst)
                     logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                 else:
                     logger.warning("Agent 配置文件不存在: %s", src)
