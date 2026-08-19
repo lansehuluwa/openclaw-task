@@ -28,21 +28,63 @@ CLI 尚未收录的模型时，生产环境应提供该目录并保证模型能�
 
 ### 2.1 GPT 中转服务
 
+一个 `config.toml` 可以同时声明多个 Responses 兼容 provider。顶层
+`model` / `model_provider` 是调用方未指定时使用的默认值；provider 的书写顺序
+没有默认含义。
+
 ```toml
+# 默认模型 ID：必须是默认 provider 实际暴露的模型名。
 model = "gpt-5.6-terra"
-model_provider = "company_responses"
+# 默认 provider ID：必须对应下面某个 model_providers.<id>。
+model_provider = "primary_gateway"
+# 默认不允许模型请求人工审批。
 approval_policy = "never"
+# 默认只允许在当前 workspace 内写文件。
 sandbox_mode = "workspace-write"
+# 默认关闭联网搜索；这与模型服务的 Responses 兼容性无关。
 web_search = "disabled"
 
-[model_providers.company_responses]
-name = "Company Responses Service"
-base_url = "https://llm.example.com/v1"
-env_key = "COMPANY_CODEX_API_KEY"
+# Provider 1：主中转服务。primary_gateway 是供 model_provider 引用的唯一 ID。
+[model_providers.primary_gateway]
+# 日志和界面中显示的名称，不参与路由。
+name = "Primary GPT Gateway"
+# Responses API 的基础地址，按供应商实际前缀填写，不写具体模型名。
+base_url = "https://primary.example.com/v1"
+# 保存 API key 的环境变量名，不是 API key 本身。
+env_key = "PRIMARY_CODEX_API_KEY"
+# Codex 使用 Responses 协议访问该服务。
+wire_api = "responses"
+
+# Provider 2：备用或另一供应商的中转服务。
+[model_providers.backup_gateway]
+name = "Backup GPT Gateway"
+base_url = "https://backup.example.com/v1"
+env_key = "BACKUP_CODEX_API_KEY"
 wire_api = "responses"
 ```
 
-`model`、`base_url` 和环境变量名按实际服务修改，API key 只通过环境变量注入。
+项目任务配置可以覆盖上述默认值，并为不同 Agent 选择不同服务：
+
+```json
+{
+  "agents": [
+    {
+      "name": "primary-agent",
+      "model": "gpt-5.6-terra",
+      "model_provider": "primary_gateway"
+    },
+    {
+      "name": "backup-agent",
+      "model": "gpt-5.5",
+      "model_provider": "backup_gateway"
+    }
+  ]
+}
+```
+
+这里的 `model_provider` 必须与 TOML 表名中的 ID 完全一致；`model` 则必须是该
+供应商实际提供的模型 ID。增加更多供应商时，继续添加独立的
+`[model_providers.<id>]` 即可。API key 只通过各自的 `env_key` 环境变量注入。
 
 ### 2.2 DeepSeek
 
