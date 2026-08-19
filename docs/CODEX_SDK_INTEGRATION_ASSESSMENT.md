@@ -139,14 +139,3 @@ export CODEX_E2E_MODEL='gpt-5.6-terra'
 export CODEX_E2E_PROVIDER='company_responses'
 python test/test_codex_integration.py
 ```
-
-当前真实 E2E 只读取预先配置的 `CODEX_E2E_HOME`，验证 Responses 调用、skill、
-多轮 thread 复用和 workspace 隔离；超时回收由离线测试覆盖。生产验收还应检查
-错误信息不泄露 API key。
-
-## 5. 当前边界
-
-- 当前只记录最终文本、usage、thread ID 和文件证据，原生工具事件尚未写入
-  trajectory；
-- Responses 兼容性不能由静态配置证明，必须对生产 provider 做真实 E2E；
-- 操作系统级子进程回收仍需在目标 Linux 服务器验收。
