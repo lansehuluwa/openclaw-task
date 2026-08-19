@@ -164,7 +164,7 @@ class HarnessAutomation:
             self.workspace_manager = OpenjiuwenWorkspaceManager("~/.openjiuwen/workspace")
         elif self.harness_type == "codex":
             from src.codex_client import CodexWorkspaceManager
-            self.workspace_manager = CodexWorkspaceManager(config.codex_workspace_base)
+            self.workspace_manager = CodexWorkspaceManager(config.workspace_base)
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -333,9 +333,8 @@ class HarnessAutomation:
         )
         from src.executor import execute_queries
 
-        async with await build_codex_client(
-            codex_home=self.config.codex_home,
-        ) as client:
+        # 标准 ~/.codex/config.toml 由部署流程预先准备；此处只启动并复用 SDK。
+        async with await build_codex_client() as client:
             self.client = client
             await self._setup_workspaces()
 
@@ -358,9 +357,7 @@ class HarnessAutomation:
             return await execute_queries(
                 queries=self.config.queries,
                 client=client,
-                get_agent_fn=make_codex_get_agent(
-                    client, workspace_manager=self.workspace_manager
-                ),
+                get_agent_fn=make_codex_get_agent(client),
                 execute_with_retry_fn=make_codex_execute_with_retry(client),
                 simulator_factory=simulator_factory,
                 agent_system_prompts=agent_system_prompts,

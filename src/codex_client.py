@@ -1,8 +1,8 @@
 """Codex Python SDK harness 客户端。
 
 一个 ``CodexClient`` 维护一个 ``AsyncCodex``/app-server；每个
-``(agent_name, session_name)`` 维护一个真实 Codex thread。provider 定义和
-密钥引用由独立 ``CODEX_HOME/config.toml`` 管理，agent 只选择 provider/model。
+``(agent_name, session_name)`` 维护一个真实 Codex thread。provider、模型和
+密钥由部署前写好的 ``~/.codex/config.toml`` 管理。
 """
 
 from __future__ import annotations
@@ -18,14 +18,9 @@ from typing import Any, Dict, List, Optional
 from openai_codex import ApprovalMode, AsyncCodex, CodexConfig, Sandbox
 
 from src.config import AgentModelConfig, warn_agent_model_conflict
-from src.workspace import BaseWorkspaceManager
+from src.workspace import BaseWorkspaceManager, copy_path
 
 logger = logging.getLogger("harness_automation")
-
-EXECUTION_MAX_ATTEMPTS = 3
-EXECUTION_RETRY_WAIT_SECONDS = 2
-TURN_INTERRUPT_GRACE_SECONDS = 5.0
-_ERROR_TEXT_LIMIT = 4000
 
 
 class CodexHarnessError(RuntimeError):
@@ -72,14 +67,6 @@ class _AgentDefaults:
     cwd: Path
 
 
-def _redact_error_text(text: str) -> str:
-    redacted = re.sub(
-        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text
-    )
-    redacted = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", redacted)
-    return redacted[-_ERROR_TEXT_LIMIT:].strip()
-
-
 def _usage_dict(usage: Any) -> Optional[Dict[str, Any]]:
     if usage is None:
         return None
@@ -107,13 +94,15 @@ class CodexAgent:
         self.session_key = session_name
         self._defaults = defaults
         self._thread = None
-        self._lock = asyncio.Lock()
 
     async def _ensure_thread(self):
         if self._thread is not None:
             return self._thread
+
+        # thread_start 不接受业务 session_name。CodexClient.get_agent 使用
+        # (agent_name, session_name) 作为缓存键，从而把同一 session 固定到本 thread。
         sdk = self._client.sdk
-        self._thread = await sdk.thread_start(
+        thread = await sdk.thread_start(
             approval_mode=ApprovalMode.deny_all,
             cwd=str(self._defaults.cwd),
             developer_instructions=self._defaults.system_prompt,
@@ -123,64 +112,28 @@ class CodexAgent:
             sandbox=Sandbox.workspace_write,
             service_name="openclaw_task_harness",
         )
+        self._thread = thread
         logger.info(
             "Codex thread 已创建: agent=%s session=%s thread=%s provider=%s model=%s",
             self.agent_name,
             self.session_name,
-            self._thread.id,
+            thread.id,
             self._defaults.model_provider,
             self._defaults.model,
         )
-        return self._thread
+        return thread
 
-    async def _stop_active_turn(self, turn, run_task) -> Optional[str]:
-        """中断当前 turn；无法确认终止时关闭整个 SDK 进程。"""
-        fallback_reason: Optional[str] = None
-
-        if turn is None:
-            fallback_reason = "Codex turn 句柄尚未返回"
-        else:
-            try:
-                await asyncio.wait_for(
-                    turn.interrupt(), timeout=TURN_INTERRUPT_GRACE_SECONDS
-                )
-            except Exception as exc:  # 中断请求失败后仍等待 turn 自行结束
-                fallback_reason = f"Codex turn 中断请求失败: {_redact_error_text(str(exc))}"
-
-            if run_task is not None:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(run_task),
-                        timeout=TURN_INTERRUPT_GRACE_SECONDS,
-                    )
-                    return None
-                except asyncio.TimeoutError:
-                    fallback_reason = (
-                        f"Codex turn 在 {TURN_INTERRUPT_GRACE_SECONDS:g}s 内未确认终止"
-                    )
-                except Exception as exc:
-                    fallback_reason = (
-                        "Codex turn 终态确认失败: "
-                        f"{_redact_error_text(str(exc))}"
-                    )
-
-        close_error: Optional[str] = None
+    async def _interrupt_turn(self, turn) -> None:
+        """通知 app-server 停止当前 turn；中断失败只记录，不覆盖原始结果。"""
         try:
-            await self._client.close()
+            await turn.interrupt()
         except Exception as exc:
-            close_error = _redact_error_text(str(exc))
-
-        if run_task is not None and not run_task.done():
-            run_task.cancel()
-        if run_task is not None:
-            await asyncio.gather(run_task, return_exceptions=True)
-
-        detail = fallback_reason or "Codex turn 未确认终止"
-        if close_error:
-            detail += f"；关闭 Codex SDK 失败: {close_error}"
-        else:
-            detail += "；已关闭 Codex SDK"
-        return detail
+            logger.warning(
+                "Codex turn 中断失败: agent=%s session=%s error=%s",
+                self.agent_name,
+                self.session_name,
+                exc,
+            )
 
     async def execute(
         self,
@@ -193,80 +146,58 @@ class CodexAgent:
             else None
         )
 
-        async with self._lock:
-            turn = None
-            run_task = None
-            try:
-                loop = asyncio.get_running_loop()
-                deadline = (
-                    loop.time() + timeout
-                    if timeout is not None
-                    else None
-                )
-                thread = (
-                    await asyncio.wait_for(self._ensure_thread(), timeout=timeout)
-                    if timeout is not None
-                    else await self._ensure_thread()
-                )
-                turn_timeout = (
-                    max(0.0, deadline - loop.time())
-                    if deadline is not None
-                    else None
-                )
-                turn = (
-                    await asyncio.wait_for(
-                        thread.turn(query), timeout=turn_timeout
-                    )
-                    if turn_timeout is not None
-                    else await thread.turn(query)
-                )
-                run_task = asyncio.create_task(turn.run())
-                if deadline is None:
-                    result = await asyncio.shield(run_task)
-                else:
-                    remaining = max(0.0, deadline - loop.time())
-                    result = await asyncio.wait_for(
-                        asyncio.shield(run_task), timeout=remaining
-                    )
-            except asyncio.TimeoutError:
-                cleanup_detail = await self._stop_active_turn(turn, run_task)
-                error_message = f"Codex turn timed out after {timeout}s"
-                if cleanup_detail:
-                    error_message += f"; {cleanup_detail}"
-                return ExecutionResult(
-                    success=False,
-                    stop_reason="timeout",
-                    error_message=error_message,
-                    session_id=getattr(self._thread, "id", None),
-                    model_provider=self._defaults.model_provider,
-                )
-            except asyncio.CancelledError:
-                await asyncio.shield(self._stop_active_turn(turn, run_task))
-                raise
-            except Exception as exc:  # SDK/app-server 错误统一收敛
-                return ExecutionResult(
-                    success=False,
-                    stop_reason="error",
-                    error_message=_redact_error_text(str(exc)),
-                    session_id=getattr(self._thread, "id", None),
-                    model_provider=self._defaults.model_provider,
-                )
+        turn = None
+        try:
+            thread = await self._ensure_thread()
 
-            content = (result.final_response or "").strip()
-            error = getattr(result, "error", None)
-            error_text = _redact_error_text(str(error)) if error else None
-            status = getattr(result, "status", None)
-            status_text = getattr(status, "value", None) or str(status or "complete")
-            success = bool(content) and error is None
+            # thread.run(query) 内部也是先创建 turn 再等待结果。这里显式取得句柄，
+            # 唯一目的是在超时或任务取消时调用 interrupt() 停止服务端执行。
+            turn = await thread.turn(query)
+            result = (
+                await asyncio.wait_for(turn.run(), timeout=timeout)
+                if timeout is not None
+                else await turn.run()
+            )
+        except asyncio.TimeoutError:
+            # wait_for 终止本地等待后，再显式通知 app-server 停止该 turn。
+            if turn is not None:
+                await self._interrupt_turn(turn)
             return ExecutionResult(
-                success=success,
-                content=content,
-                stop_reason="complete" if success else status_text,
-                error_message=error_text or (None if success else "Codex 未返回最终文本"),
-                usage=_usage_dict(getattr(result, "usage", None)),
-                session_id=thread.id,
+                success=False,
+                stop_reason="timeout",
+                error_message=f"Codex turn timed out after {timeout}s",
+                session_id=getattr(self._thread, "id", None),
                 model_provider=self._defaults.model_provider,
             )
+        except asyncio.CancelledError:
+            if turn is not None:
+                await self._interrupt_turn(turn)
+            raise
+        except Exception as exc:
+            return ExecutionResult(
+                success=False,
+                stop_reason="error",
+                error_message=str(exc),
+                session_id=getattr(self._thread, "id", None),
+                model_provider=self._defaults.model_provider,
+            )
+
+        content = (result.final_response or "").strip()
+        error = getattr(result, "error", None)
+        status = getattr(result, "status", None)
+        status_text = getattr(status, "value", None) or str(status or "complete")
+        success = bool(content) and error is None
+        return ExecutionResult(
+            success=success,
+            content=content,
+            stop_reason="complete" if success else status_text,
+            error_message=(
+                str(error) if error else (None if success else "Codex 未返回最终文本")
+            ),
+            usage=_usage_dict(getattr(result, "usage", None)),
+            session_id=thread.id,
+            model_provider=self._defaults.model_provider,
+        )
 
 
 class CodexClient:
@@ -339,8 +270,8 @@ class CodexClient:
         return self._agents[key]
 
 
-async def build_codex_client(codex_home: str) -> CodexClient:
-    """使用部署阶段已经准备好的 CODEX_HOME 启动 Codex。"""
+async def build_codex_client(codex_home: str = "~/.codex") -> CodexClient:
+    """使用部署阶段已经准备好的标准 Codex 配置目录启动 SDK。"""
     return CodexClient(Path(codex_home).expanduser())
 
 
@@ -404,22 +335,19 @@ class CodexWorkspaceManager(BaseWorkspaceManager):
         agent_dir: str,
     ) -> None:
         source_dir = Path(agent_dir).expanduser()
-        sections: List[str] = []
+        if not source_dir.is_dir():
+            logger.warning("Agent 源目录不存在: %s", source_dir)
+            return
+
         for config_file in config_files:
             source = source_dir / config_file
-            if not source.is_file():
+            if not source.exists():
                 logger.warning("Agent 配置文件不存在: %s", source)
                 continue
-            sections.append(
-                f"## {config_file}\n\n{source.read_text(encoding='utf-8').strip()}"
-            )
-        if sections:
-            target = workspace / "AGENTS.md"
-            target.write_text(
-                "# Agent 配置\n\n" + "\n\n".join(sections) + "\n",
-                encoding="utf-8",
-            )
-            logger.info("生成 Codex Agent 配置: %s", target)
+            target = workspace / config_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            copy_path(source, target)
+            logger.info("复制 Agent 配置: %s -> %s", config_file, target)
 
 
 class CodexAgentManager:
@@ -441,11 +369,10 @@ class CodexAgentManager:
             warn_agent_model_conflict(agent_name, agent_config.model, override)
 
         model = override.model if override and override.model else agent_config.model
-        model_provider = (
-            override.provider
-            if override and override.provider
-            else agent_config.model_provider
-        )
+        model_provider = override.provider if override else None
+        # 沿用项目已有的 provider/model 写法，无需给 src.config 增加字段。
+        if model_provider is None and model and "/" in model:
+            model_provider, model = model.split("/", 1)
         workspace = self.workspace_manager.get_agent_workspace(agent_name)
         self.client.register_agent_defaults(
             agent_name,
@@ -465,37 +392,20 @@ class CodexAgentManager:
 
 def make_codex_get_agent(
     client: CodexClient,
-    workspace_manager: Optional[CodexWorkspaceManager] = None,
 ):
     def get_agent(agent_name: str, session_name: str) -> CodexAgent:
-        # workspace 在 setup_agent 时已经注册；此处保留参数以对齐其他 harness。
         return client.get_agent(agent_name, session_name)
 
     return get_agent
 
 
-def make_codex_execute_with_retry(client: CodexClient):
+def make_codex_execute_with_retry(_client: CodexClient):
     async def execute_with_retry(agent: CodexAgent, query_text: str, options):
-        last_error: Optional[str] = None
-        for attempt in range(1, EXECUTION_MAX_ATTEMPTS + 1):
-            result = await agent.execute(query_text, options=options)
-            if result.success and result.content:
-                return result, False
-
-            last_error = result.error_message or "Codex 返回空结果"
-            # turn 超时后的副作用状态未知，不能在同一 thread 自动重发。
-            if result.stop_reason == "timeout":
-                raise CodexHarnessError(last_error)
-            if attempt >= EXECUTION_MAX_ATTEMPTS:
-                break
-            logger.warning(
-                "Codex 调用失败 (第 %d/%d 次): %s; %ds 后重试",
-                attempt,
-                EXECUTION_MAX_ATTEMPTS,
-                last_error,
-                EXECUTION_RETRY_WAIT_SECONDS,
-            )
-            await asyncio.sleep(EXECUTION_RETRY_WAIT_SECONDS)
-        raise CodexHarnessError(last_error or "Codex 调用失败")
+        # Codex turn 可能已产生文件副作用，同一请求不在内部自动重放。
+        result = await agent.execute(query_text, options=options)
+        if result.success and result.content:
+            incomplete = (result.stop_reason or "complete") != "complete"
+            return result, incomplete
+        raise CodexHarnessError(result.error_message or "Codex 返回空结果")
 
     return execute_with_retry

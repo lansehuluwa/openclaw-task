@@ -31,8 +31,9 @@
 > app-server，每个 `(agent_name, session_name)` 维护一个真实 thread；每个 Agent
 > 使用独立 workspace，项目级技能放在 `.agents/skills`。
 
-Codex 直接读取部署前准备好的 `CODEX_HOME/config.toml`，Agent 通过
-`model_provider` 选择服务，密钥只从环境变量读取。详见
+Codex 直接读取部署前准备好的 `~/.codex/config.toml`，Agent 通过
+现有 `simulator_config` 的 `provider` 选择服务；服务地址和明文密钥均在
+`config.toml` 中配置。详见
 [Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
 
 ## 特性
@@ -115,7 +116,6 @@ python hermes_automation.py   --config configs/config_simple.json
 | `example_config.json` | 完整示例 - 研究+写作流水线 |
 | `config_simple.json` | 简单示例 - 基础问答 |
 | `config_code_review.json` | 高级示例 - 代码审查流程 |
-| `config_codex.json` | Codex 真实文件任务和多轮专项测试 |
 
 ### Hermes 端文件 (一体化新增)
 
@@ -128,9 +128,9 @@ python hermes_automation.py   --config configs/config_simple.json
 | `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
 | `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
 
-## 测试矩阵（3 Harness × 3 配置）
+## 通用配置测试矩阵
 
-系统支持 3 种 harness 后端和 3 种配置模式的自由组合，共 9 种场景。核心配置文件为：
+各 harness 使用同一组核心配置文件：
 
 | 配置文件 | 模式 | `use_simulator` | `evaluate` |
 |----------|------|:-:|:-:|
@@ -138,13 +138,14 @@ python hermes_automation.py   --config configs/config_simple.json
 | `config_user.json` | + User Simulator | `true` | 无 |
 | `config_simple_eval.json` | + Evaluator | `true` | 有 |
 
-### 3 × 3 矩阵
+### 配置覆盖
 
 | | `config_simple.json` | `config_user.json` | `config_simple_eval.json` |
 |---|---|---|---|
 | **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **Codex** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 
 ### 运行方式
 
@@ -164,8 +165,10 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 python harness_automation.py --harness claudecode --config configs/config_user.json
 python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
 
-# Codex 使用专项配置；不属于上面的通用配置矩阵
-python harness_automation.py --harness codex --config configs/config_codex.json
+# Codex
+python harness_automation.py --harness codex --config configs/config_simple.json
+python harness_automation.py --harness codex --config configs/config_user.json
+python harness_automation.py --harness codex --config configs/config_simple_eval.json
 ```
 
 ### 模型配置模式
@@ -183,19 +186,16 @@ python harness_automation.py --harness codex --config configs/config_codex.json
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
-| **Codex** | `thread_start(model_provider=..., model=...)` | provider ID 与模型名分字段 | `model_provider` |
+| **Codex** | `config.toml` + `thread_start` | 模型名与 provider 分字段 | `provider` |
 
-`user_proxy_model.json` 统一调配 OpenClaw、Hermes 和 ClaudeCode 的模型。OpenClaw
-场景需要配 `provider` 字段拼接 `provider/model`；Codex 使用独立
-`CODEX_HOME/config.toml`，不读取该文件中的 provider 定义：
+`user_proxy_model.json` 统一调配各 Agent 的模型。Codex 只读取其中的 `model` 和
+`provider` 作为选择项，provider 定义、服务地址和密钥来自 `~/.codex/config.toml`：
 
 ```json
 {
-  "evaluator": {
-    "model": "deepseek-v4-flash",
-    "provider": "api-proxy-deepseek",
-    "base_url": "http://...",
-    "api_key": "sk-..."
+  "main": {
+    "model": "gpt-5.6-terra",
+    "provider": "primary_gateway"
   }
 }
 ```
