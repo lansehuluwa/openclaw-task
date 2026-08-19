@@ -1,0 +1,13 @@
+# 自定义 Responses 服务配置示例。
+# Linux 部署启动前按实际服务修改，并复制到 $CODEX_HOME/config.toml。
+model = "gpt-5.6-terra"
+model_provider = "company_responses"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "disabled"
+
+[model_providers.company_responses]
+name = "Company Responses Service"
+base_url = "https://llm.example.com/v1"
+env_key = "COMPANY_CODEX_API_KEY"
+wire_api = "responses"

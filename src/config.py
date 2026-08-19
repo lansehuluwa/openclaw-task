@@ -92,6 +92,10 @@ class AgentConfigItem(BaseModel):
     skills: List[str] = Field(default_factory=list, description="所需技能列表")
     system_prompt: Optional[str] = Field(None, description="系统提示词")
     model: Optional[str] = Field(None, description="使用的模型")
+    model_provider: Optional[str] = Field(
+        None,
+        description="Codex 模型服务商 ID，对应 config.toml 的 model_providers.<id>",
+    )
 
 
 class AgentModelConfig(BaseModel):
@@ -158,7 +162,10 @@ class QueryItem(BaseModel):
 
 class AutomationConfig(BaseModel):
     """完整的自动化配置"""
-    harness_type: str = Field("openclaw", description="harness 类型: openclaw 或 hermes")
+    harness_type: str = Field(
+        "openclaw",
+        description="harness 类型: openclaw/hermes/claude-code/openjiuwen/codex",
+    )
 
     system: SystemConfig = Field(default_factory=SystemConfig)
     input_dir: InputDirConfig = Field(default_factory=InputDirConfig)
@@ -171,6 +178,15 @@ class AutomationConfig(BaseModel):
     gateway_timeout: Optional[int] = Field(None, description="Gateway 连接/调用超时(秒)")
     workspace_base: str = Field(r"C:\Users\nianzu\.openclaw\workspace", description="工作空间基础目录")
 
+    # Codex 专用配置。默认目录刻意避开 ~/.codex，防止自动化污染个人配置。
+    codex_home: str = Field(
+        "~/.codex-harness/home",
+        description="Codex harness 的 CODEX_HOME，默认与个人 ~/.codex 隔离",
+    )
+    codex_workspace_base: str = Field(
+        "~/.codex-harness/workspace",
+        description="Codex 各 Agent 的独立工作空间根目录",
+    )
     # User Simulator 配置
     user_profile: str = Field("", description="用户画像兜底文本,profile_file 不存在时使用")
     simulator_config: Optional[str] = Field(None, description="模型配置 JSON 绝对路径,顶层 model/api_key/base_url 用于 user_simulator;可选嵌套 {agent_name: {model,api_key,base_url}} 用于覆盖 harness agent")

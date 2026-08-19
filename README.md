@@ -4,6 +4,7 @@
 - Hermes
 - Claude-Code
 - Openjiuwen
+- Codex
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -23,6 +24,16 @@
 ## Openjiuwen
 > `from openjiuwen.core` | openjiuwen 要显式在白名单里选 provider client（Anthropic / OpenAI / DeepSeek...），不在白名单的字符串兜底成 OpenAI。anthropic-messages 必须写 provider: "Anthropic"| `不支持TOOLS.md, 装配 rails/tools工具说明动态生成` | `~/.openjiuwen/openjiuwen.json `全局兜底
 详见 `src/openjiuwen_client.py`。
+
+## Codex
+
+> 基于官方 `openai-codex` Python SDK。一个 run 维护一个 `AsyncCodex`
+> app-server，每个 `(agent_name, session_name)` 维护一个真实 thread；每个 Agent
+> 使用独立 workspace，项目级技能放在 `.agents/skills`。
+
+Codex 直接读取部署前准备好的 `CODEX_HOME/config.toml`，Agent 通过
+`model_provider` 选择服务，密钥只从环境变量读取。详见
+[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
 
 ## 特性
 
@@ -82,6 +93,7 @@ python hermes_automation.py   --config configs/config_simple.json
 ## 文档
 
 - **[快速开始](QUICKSTART.md)** - 5 分钟入门指南
+- **[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)** - Python SDK、provider、workspace、skill、thread 与测试
 - **[设计文档](DESIGN.md)** - 详细的架构和 API 文档
 - **[示例代码](examples.py)** - 10 个实用示例
 
@@ -103,6 +115,7 @@ python hermes_automation.py   --config configs/config_simple.json
 | `example_config.json` | 完整示例 - 研究+写作流水线 |
 | `config_simple.json` | 简单示例 - 基础问答 |
 | `config_code_review.json` | 高级示例 - 代码审查流程 |
+| `config_codex.json` | Codex 多 provider、多技能和多轮专项测试 |
 
 ### Hermes 端文件 (一体化新增)
 
@@ -150,9 +163,12 @@ python harness_automation.py --harness hermes --config configs/config_simple_eva
 python harness_automation.py --harness claudecode --config configs/config_simple.json
 python harness_automation.py --harness claudecode --config configs/config_user.json
 python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+
+# Codex 使用专项配置；不属于上面的通用配置矩阵
+python harness_automation.py --harness codex --config configs/config_codex.json
 ```
 
-### 三种配置模式
+### 模型配置模式
 
 | 模式 | 说明 |
 |------|------|
@@ -167,8 +183,11 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+| **Codex** | `thread_start(model_provider=..., model=...)` | provider ID 与模型名分字段 | `model_provider` |
 
-`user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
+`user_proxy_model.json` 统一调配 OpenClaw、Hermes 和 ClaudeCode 的模型。OpenClaw
+场景需要配 `provider` 字段拼接 `provider/model`；Codex 使用独立
+`CODEX_HOME/config.toml`，不读取该文件中的 provider 定义：
 
 ```json
 {

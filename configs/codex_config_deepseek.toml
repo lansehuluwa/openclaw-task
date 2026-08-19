@@ -1,0 +1,21 @@
+# DeepSeek Responses 配置示例。
+# Linux 部署启动前补充 model_catalog_json，并复制到 $CODEX_HOME/config.toml。
+model = "deepseek-v4-flash"
+model_provider = "deepseek_main"
+model_reasoning_effort = "high"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+web_search = "disabled"
+
+[model_providers.deepseek_main]
+name = "DeepSeek Main"
+base_url = "https://api.deepseek.com/"
+env_key = "DEEPSEEK_MAIN_API_KEY"
+wire_api = "responses"
+
+# E2E 使用第二个 provider ID 验证同一 app-server 的 provider 隔离。
+[model_providers.eval_proxy]
+name = "Evaluator Proxy"
+base_url = "https://api.deepseek.com/"
+env_key = "EVAL_PROXY_API_KEY"
+wire_api = "responses"

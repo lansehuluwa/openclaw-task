@@ -58,6 +58,7 @@ python openclaw_automation.py config.json
 
 ## 文档
 
+- **[Codex SDK 集成说明](CODEX_SDK_INTEGRATION_ASSESSMENT.md)** - Python SDK、provider、workspace、skill、thread 与测试
 - **[快速开始](QUICKSTART.md)** - 5 分钟入门指南
 - **[设计文档](DESIGN.md)** - 详细的架构和 API 文档
 - **[示例代码](examples.py)** - 10 个实用示例
