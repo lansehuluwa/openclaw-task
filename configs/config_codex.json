@@ -1,0 +1,72 @@
+{
+  "harness_type": "codex",
+  "system": {
+    "platform": ["linux"],
+    "python": "3.12",
+    "tools": []
+  },
+  "input_dir": {
+    "skill_dir": "skills",
+    "agent_dir": null,
+    "user_dir": null
+  },
+  "agents": [
+    {
+      "name": "deepseek-main",
+      "config": [],
+      "skills": [],
+      "system_prompt": "你是主任务 Agent，严格按用户要求简洁回答。",
+      "model": "deepseek-v4-flash",
+      "model_provider": "deepseek"
+    },
+    {
+      "name": "data-analysis",
+      "config": [],
+      "skills": [],
+      "system_prompt": "你是数据分析 Agent，必须实际运行代码并核对生成文件。",
+      "model": "deepseek-v4-flash",
+      "model_provider": "deepseek"
+    },
+    {
+      "name": "conversation",
+      "config": [],
+      "skills": [],
+      "system_prompt": "你要记住同一会话前文，并严格按要求回答。",
+      "model": "deepseek-v4-flash",
+      "model_provider": "deepseek"
+    }
+  ],
+  "queries": [
+    {
+      "agent_name": "deepseek-main",
+      "text": "请用中文解释快速排序的核心思想，说明平均和最坏时间复杂度，并给出一个可直接运行的 Python 实现和简单示例。",
+      "session_name": "provider_main",
+      "timeout": 300,
+      "use_simulator": false
+    },
+    {
+      "agent_name": "data-analysis",
+      "text": "请使用 Python 和固定随机种子 42，模拟 20 名受访者的受教育年限、工龄和月薪。在当前工作空间生成 survey_data.csv，计算三项的均值、样本标准差及两两 Pearson 相关系数，并将方法、结果和结论写入 survey_analysis.md。请实际运行代码核对结果，最后简要报告生成的文件和最强的相关关系。",
+      "session_name": "data_analysis",
+      "timeout": 600,
+      "use_simulator": false
+    },
+    {
+      "agent_name": "conversation",
+      "text": "我要在当前工作空间实现一个不依赖第三方库的 Python 素数判断工具：n 小于 2 时返回 False，并覆盖常见边界情况。这一轮只给出实现方案和测试用例设计，不要创建文件。",
+      "session_name": "memory",
+      "timeout": 300,
+      "use_simulator": false
+    },
+    {
+      "agent_name": "conversation",
+      "text": "现在按照上一轮确定的约束，在工作空间创建 prime_utils.py 和 test_prime_utils.py，运行测试，并报告实现要点和测试结果。",
+      "session_name": "memory",
+      "timeout": 300,
+      "use_simulator": false
+    }
+  ],
+  "codex_home": "~/.codex-harness/openclaw-task/home",
+  "codex_workspace_base": "~/.codex-harness/openclaw-task/workspace",
+  "user_max_turn": 4
+}
