@@ -240,14 +240,15 @@ class CodexWorkspaceManagerTests(unittest.TestCase):
             manager = CodexWorkspaceManager(str(root / "workspaces"))
 
             manager.setup_agent_files(
-                agent_name="demo-agent",
+                agent_name="demo agent",
                 config_files=["USER.md", "SOUL.md"],
                 skill_base_dir=None,
                 agent_skills=[],
                 agent_dir=str(source),
             )
 
-            workspace = manager.get_agent_workspace("demo-agent")
+            workspace = manager.get_agent_workspace("demo agent")
+            self.assertEqual(workspace, root / "workspaces" / "demo agent")
             self.assertEqual(
                 (workspace / "USER.md").read_text(encoding="utf-8"), "user"
             )

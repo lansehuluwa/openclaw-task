@@ -304,10 +304,7 @@ class CodexWorkspaceManager(BaseWorkspaceManager):
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_agent_workspace(self, agent_name: str) -> Path:
-        normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", agent_name).strip("-.")
-        if not normalized:
-            raise CodexHarnessError(f"无法生成 workspace 目录名: {agent_name!r}")
-        workspace = self.base_dir / normalized
+        workspace = self.base_dir / agent_name
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / self.skills_subdir).mkdir(parents=True, exist_ok=True)
         return workspace

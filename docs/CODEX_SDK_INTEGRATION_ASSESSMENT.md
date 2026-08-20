@@ -96,8 +96,9 @@ wire_api = "responses"
 ## 3. Workspace 与会话
 
 - Codex 固定使用 `~/.codex/workspace`，任务 JSON 中的 `workspace_base` 不改变该路径；
-- `~/.codex/workspace/<agent>` 是 Agent 模板目录；配置文件和 skill 先放入模板，
-  首次创建 thread 时再复制到实际 session 目录；
+- `~/.codex/workspace/<agent>` 是 Agent 模板目录，`<agent>` 直接使用配置中的
+  `agent_name`；配置文件和 skill 先放入模板，首次创建 thread 时再复制到实际
+  session 目录；
 - 普通 Agent 的运行时 session 名为
   `<query.session_name 或 main>_<run_id>`；evaluator 为
   `eval_<evaluate.session_name 或 query.session_name 或 main>_<run_id>`。
@@ -114,8 +115,7 @@ wire_api = "responses"
   Evaluator cwd：~/.codex/workspace/evaluator/.sessions/eval_eval_test_20260820T104927
   ```
 
-- Agent 和 session 的路径片段只保留字母、数字、`.`、`_`、`-`，其他字符替换为
-  `-`；
+- session 的路径片段只保留字母、数字、`.`、`_`、`-`，其他字符替换为 `-`；
 - 当前进程内，相同 `(agent_name, 运行时 session 名)` 复用同一个 thread；session
   目录保留文件，但进程退出后不会恢复旧 thread 或对话上下文；
 - `system_prompt` 作为 thread 的开发者指令；
