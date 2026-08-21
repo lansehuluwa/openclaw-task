@@ -188,18 +188,15 @@ python harness_automation.py --harness pi --config configs/config_simple_eval.js
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
 | **Pi** | `models.json` + CLI 参数 | 模型名与 provider 分字段 | `provider` |
 
-`user_proxy_model.json` 统一调配各 Agent 的模型。Pi 会把同名 Agent 的
-`model`、`provider`、`base_url`、`api_key` 和 `api` 转成该 Agent 独立的
-`models.json`，并作为实际服务配置：
+`user_proxy_model.json` 统一调配各 Agent 的模型。Pi 只读取其中的 `model` 和
+`provider` 作为选择项，provider 定义、服务地址和密钥来自
+`~/.pi/agent/models.json`：
 
 ```json
 {
   "main": {
     "model": "gpt-5.6-terra",
-    "provider": "primary_gateway",
-    "base_url": "https://primary.example.com/v1",
-    "api_key": "primary-key",
-    "api": "openai-responses"
+    "provider": "primary_gateway"
   }
 }
 ```

@@ -41,8 +41,8 @@ RPC 子进程在同一会话内持续运行，所以多轮对话保留上下文�
 
 ## 2. Pi 配置
 
-未在 `simulator_config` 中覆盖的 Agent 使用 Pi 标准目录 `~/.pi/agent` 中的默认
-配置。
+部署前将模型配置写入 Pi 标准目录 `~/.pi/agent`。项目只读取该目录，不生成、
+复制或修改其中的配置。
 
 自定义服务写入 `~/.pi/agent/models.json`。下面示例直接使用明文地址和密钥：
 
@@ -89,10 +89,8 @@ RPC 子进程在同一会话内持续运行，所以多轮对话保留上下文�
 }
 ```
 
-`provider`、`model`、`base_url`、`api_key` 和 `api` 会转换为该 Agent 的
-`~/.pi/workspace/<agent>/.pi-agent/models.json`，RPC 子进程通过
-`PI_CODING_AGENT_DIR` 使用它；其中服务地址和密钥均按原值明文写入。未填写
-`api` 时默认使用 `openai-completions`。
+`provider` 必须与 `models.json` 中 `providers` 的键一致。Pi 不使用该 JSON 中的
+`base_url` 和 `api_key`，连接信息统一来自 `~/.pi/agent/models.json`。
 
 ## 3. Workspace 与会话
 
