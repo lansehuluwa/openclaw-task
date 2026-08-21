@@ -25,17 +25,26 @@ from src.evaluator.trajectory import (
     ToolCallEvidence,
     build_turn_record, 
     capture_file_evidence,
-    extract_tool_calls
+    extract_tool_calls,
+    extract_tool_calls_openai,
+)
+# 后台监测机制(子代理 spawn 完成检测 + 真实交付提取)
+from bg_watch import (
+    BG_NEW_CONTENT,
+    BG_TIMEOUT,
+    BG_WATCH_INTERVAL,
+    BG_WATCH_TIMEOUT,
+    _background_watch,
+    _collect_spawned_children,
+    _gateway_of,
+    _new_messages_since,
+    _safe_chat_history,
 )
 
 logger = logging.getLogger("harness_automation")
 
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
-EXECUTION_HISTORY_FALLBACK_LIMIT = 50
-EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
-EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
-
 
 def _replace_variables(text: str, results: Dict[str, Any]) -> str:
     pattern = r'\{result_(\w+)\}'
@@ -51,39 +60,6 @@ def _replace_variables(text: str, results: Dict[str, Any]) -> str:
 
     return re.sub(pattern, replacer, text)
 
-
-async def _safe_chat_history(agent) -> List[dict[str, Any]]:
-    """安全拉取被测 agent 会话历史(失败降级为空,绝不中断主流程)。
-
-    仅 OpenClaw client 提供 `gateway.chat_history`;Hermes/Claudecode 无 gateway,
-    直接返回空(其 ExecutionResult 自带完整历史,不需要此 fallback)。
-    """
-    gateway = getattr(getattr(agent, "_client", None), "gateway", None)
-    if gateway is None:
-        return []
-    try:
-        return await gateway.chat_history(
-            agent.session_key, limit=EXECUTION_HISTORY_FALLBACK_LIMIT
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.debug("chat_history 采集失败: %s", e)
-        return []
-
-def _new_messages_since(
-    before: List[dict[str, Any]], after: List[dict[str, Any]]
-) -> List[dict[str, Any]]:
-    """从 after 取出相对 before 新增的消息(按 timestamp 界,稳健于 limit 截断)。"""
-    if not after:
-        return []
-    if not before:
-        return list(after)
-    before_max_ts = max(
-        (m.get("timestamp", 0) for m in before if isinstance(m, dict)), default=0
-    )
-    return [
-        m for m in after
-        if isinstance(m, dict) and m.get("timestamp", 0) > before_max_ts
-    ]
 
 async def process_turn(
     client: Any,
@@ -116,10 +92,20 @@ async def process_turn(
     turn_tool_calls: Optional[List[ToolCallEvidence]] = None
     if agent is not None:
         try:
-            after_history = await _safe_chat_history(agent)
-            new_msgs = _new_messages_since(before_history or [], after_history)
-            turn_tool_calls = extract_tool_calls(new_msgs)
-            # 兜底但从 history 救回了工具证据 → 不再算"证据不完整"
+            gateway = getattr(getattr(agent, "_client", None), "gateway", None)
+            if gateway is None:
+                # Hermes/ClaudeCode:无 gateway,chat_history 恒空。工具证据只能从
+                # ExecutionResult.messages(run_conversation 返回的原生 OpenAI 消息)解析。
+                # _history 只存纯文本 user/assistant 对(无 tool_calls),故整份解析
+                # 天然只命中本轮工具调用,历史轮不贡献。
+                native_msgs = getattr(result, "messages", None) or []
+                turn_tool_calls = extract_tool_calls_openai(native_msgs)
+            else:
+                # OpenClaw:走网关 chat_history,按 timestamp 增量截取本轮新增消息。
+                after_history = await _safe_chat_history(agent)
+                new_msgs = _new_messages_since(before_history or [], after_history)
+                turn_tool_calls = extract_tool_calls(new_msgs)
+            # 兜底但从证据里救回了工具调用 → 不再算"证据不完整"
             if evidence_incomplete and turn_tool_calls:
                 evidence_incomplete = False
         except Exception as e:  # noqa: BLE001
@@ -166,6 +152,7 @@ async def process_turn(
     if evaluator.to_simulator and ev is not None and ev.task_declared_complete:
         return evaluator.format_feedback(ev)
     return None
+
 
 async def execute_queries(
     queries: List[QueryItem],
@@ -277,13 +264,46 @@ async def execute_queries(
             if query_simulator is None:
                 success = True
                 break
-            
+            # 后台监测: 扫描本轮增量消息，从 sessions_spawn 里提取 childSessionKey
+            # 等全部子代理都完成(completion event 收齐)后才进入下一轮真实对话。
+            #   - 全部完成 → 取父 agent 最终交付给 S,清空待完成集合,正常走本轮
+            #   - 超时/子代理进程失效 → 兜底,注入系统提示促 simulator 追问
+            bg_notice = ""
+            newly_spawned = await _collect_spawned_children(agent, before_history)
+            # pending_children 挂在 agent 上跨轮持久,覆盖"上一轮未完成的子代理超时未完成"的情况
+            pending_children: set = getattr(agent, "_bg_pending_children", None) or set()
+            pending_children.update(newly_spawned)
+
+            if pending_children:
+                logger.info(
+                    "[后台检测] 待完成子代理 %d 个(turn=%d): %s",
+                    len(pending_children), turn, sorted(pending_children),
+                )
+                bg_status, bg_text = await _background_watch(
+                    agent, before_history, list(pending_children),
+                )
+                if bg_status == BG_NEW_CONTENT and bg_text:
+                    # 全部子代理完成,父 agent 已综合交付 → 本轮真实交付
+                    agent_reply = bg_text
+                    result = result.model_copy(update={"content": bg_text})
+                    last_result = result
+                    logger.info("[A%d·后台交付] %s", turn, agent_reply)
+                    pending_children.clear()
+                else:
+                    # 超时兜底:未完成子代理保留在 pending,带入下一轮继续追踪
+                    wait_min = int(BG_WATCH_TIMEOUT // 60) or 1
+                    bg_notice = (
+                        f"\n\n【系统提示】后台子代理长时间未全部完成,"
+                        f"已等待约 {wait_min} 分钟。请向对方确认后台任务实际进展"
+                    )
+            agent._bg_pending_children = pending_children  # 空集也回写,确保状态一致
+
             evaluator_feedback = await process_turn(
                 client, query, turn, current_query, result, evidence_incomplete,
                 trajectory, evaluator, agent=agent, before_history=before_history,
             )
 
-            user_reply = query_simulator.chat(agent_reply, evaluator_feedback=evaluator_feedback)
+            user_reply = query_simulator.chat(agent_reply + bg_notice, evaluator_feedback=evaluator_feedback)
             logger.debug("[S%d] %s", turn, user_reply)
 
             # 空 user_reply 绝不能原样作为下一轮 current_query 下发给网关
@@ -335,25 +355,38 @@ async def execute_queries(
 
 
 def _make_options(timeout: int):
-    """构造 ExecutionOptions — 延迟导入避免循环依赖"""
-    try:
-        from openclaw_sdk import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.hermes_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.claudecode_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.openjiuwen_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
+    """构造 ExecutionOptions — 延迟导入避免循环依赖。"""
+    # (module, attr) 优先级序列;openclaw_sdk 在前,带 3600 上限绕过
+    candidates = [
+        ("openclaw_sdk", "ExecutionOptions"),
+        ("src.hermes_client", "ExecutionOptions"),
+        ("src.claudecode_client", "ExecutionOptions"),
+        ("src.openjiuwen_client", "ExecutionOptions"),
+        ("src.opencode_client", "ExecutionOptions"),
+        ("src.codex_client", "ExecutionOptions"),
+    ]
+    for mod_path, cls_name in candidates:
+        try:
+            mod = __import__(mod_path, fromlist=[cls_name])
+            Cls = getattr(mod, cls_name)
+        except ImportError:
+            continue
+
+        # openclaw_sdk: pydantic 约束 le=3600,需绕过
+        if mod_path == "openclaw_sdk":
+            opts = Cls()
+            try:
+                object.__setattr__(opts, "timeout_seconds", int(timeout))
+            except Exception:
+                from pydantic import Field
+                class _Unbounded(Cls):
+                    timeout_seconds: int = Field(default=300, ge=1)
+                opts = _Unbounded(timeout_seconds=int(timeout))
+            if timeout > 3600:
+                logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
+            return opts
+
+        # 其余 harness:简单 dataclass,直接构造
+        return Cls(timeout_seconds=timeout)
+
     return None

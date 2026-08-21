@@ -1,7 +1,13 @@
 """
 统一自动化任务执行系统 (Harness Automation)
 
-通过配置文件中的 harness_type 字段切换 openclaw / hermes 两种 harness 实现。
+通过配置文件中的 harness_type 字段切换 :
+- openclaw 
+- hermes 
+- claude-code
+- openjiuwen
+- opencode
+- codex
 共享部分: Simulator 工厂、main/CLI 入口。
 特有部分: WorkspaceManager / AgentManager 由 src/ 下的模块提供。
 统一查询执行器: src.executor.execute_queries (回调注入差异)。
@@ -155,12 +161,18 @@ class HarnessAutomation:
         if self.harness_type == "hermes":
             from src.hermes_client import HermesWorkspaceManager
             self.workspace_manager = HermesWorkspaceManager("~/.hermes")
+        elif self.harness_type == "opencode":
+            from src.opencode_client import OpenCodeWorkspaceManager
+            self.workspace_manager = OpenCodeWorkspaceManager("~/.config/opencode/workspace")
         elif self.harness_type == "claude-code":
             from src.claudecode_client import ClaudecodeWorkspaceManager
             self.workspace_manager = ClaudecodeWorkspaceManager("~/.claude/workspace")
         elif self.harness_type == "openjiuwen":
             from src.openjiuwen_client import OpenjiuwenWorkspaceManager
             self.workspace_manager = OpenjiuwenWorkspaceManager("~/.openjiuwen/workspace")
+        elif self.harness_type == "codex":
+            from src.codex_client import CodexWorkspaceManager
+            self.workspace_manager = CodexWorkspaceManager("~/.codex/workspace")
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -173,10 +185,14 @@ class HarnessAutomation:
 
         if self.harness_type == "hermes":
             return await self._run_hermes()
+        elif self.harness_type == "opencode":
+            return await self._run_opencode()
         elif self.harness_type == "claude-code":
             return await self._run_claudecode()
         elif self.harness_type == "openjiuwen":
             return await self._run_openjiuwen()
+        elif self.harness_type == "codex":
+            return await self._run_codex()
         else:
             return await self._run_openclaw()
 
@@ -254,6 +270,41 @@ class HarnessAutomation:
             )
             return results
 
+    async def _run_opencode(self) -> Dict[str, Any]:
+        from src.opencode_client import (
+            build_opencode_client,
+            OpenCodeAgentManager,
+            make_opencode_execute_with_retry,
+            make_opencode_get_agent,
+        )
+        from src.executor import execute_queries
+
+
+        async with await build_opencode_client() as client:
+            self.client = client
+
+            await self._setup_workspaces()
+
+            agent_manager = OpenCodeAgentManager(client, self.workspace_manager, agent_overrides=self.agent_overrides)
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(self.config, self.simulator_model_cfg)
+            agent_system_prompts = {
+                a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_opencode_get_agent(client, workspace_manager=self.workspace_manager, agent_overrides=self.agent_overrides),
+                execute_with_retry_fn=make_opencode_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID
+            )
+            return results
+
     async def _run_claudecode(self) -> Dict[str, Any]:
         from src.claudecode_client import (
             build_claudecode_client,
@@ -317,6 +368,48 @@ class HarnessAutomation:
                 run_id=_RUN_ID,
             )
             return results
+
+    async def _run_codex(self) -> Dict[str, Any]:
+        from src.codex_client import (
+            CodexAgentManager,
+            build_codex_client,
+            make_codex_execute_with_retry,
+            make_codex_get_agent,
+        )
+        from src.executor import execute_queries
+
+        # 标准 ~/.codex/config.toml 由部署流程预先准备；此处只启动并复用 SDK。
+        async with await build_codex_client() as client:
+            self.client = client
+            await self._setup_workspaces()
+
+            agent_manager = CodexAgentManager(
+                client,
+                self.workspace_manager,
+                agent_overrides=self.agent_overrides,
+            )
+            for agent_config in self.config.agents:
+                await agent_manager.setup_agent(agent_config)
+
+            simulator_factory = lambda: create_simulator(
+                self.config, self.simulator_model_cfg
+            )
+            agent_system_prompts = {
+                a.name: a.system_prompt
+                for a in self.config.agents
+                if a.system_prompt
+            }
+            results = await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_codex_get_agent(client),
+                execute_with_retry_fn=make_codex_execute_with_retry(client),
+                simulator_factory=simulator_factory,
+                agent_system_prompts=agent_system_prompts,
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
+            return results
           
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
@@ -337,7 +430,9 @@ class HarnessAutomation:
             elif user_dir_config.map_file:
                 map_path = self._resolve_map_file(user_dir_config.path, user_dir_config.map_file)
                 data_dir = str(content_root)
-                self.workspace_manager.setup_from_map(map_path, base_dir=data_dir)
+                self.workspace_manager.setup_from_map(
+                    map_path, base_dir=data_dir, agent_name=self._primary_agent_name(),
+                )
             else:
                 content_root_path = str(content_root)
 
@@ -358,6 +453,11 @@ class HarnessAutomation:
             p = p.with_suffix('.json')
         return str(p)
 
+    def _primary_agent_name(self) -> str:
+        for query in self.config.queries:
+            if query.agent_name != "evaluator":
+                return query.agent_name
+        return "main"
 
 # ============================================================================
 # 主入口函数

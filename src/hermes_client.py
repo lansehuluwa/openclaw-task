@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from run_agent import AIAgent as _AIAgent  # noqa: F401
 
-from src.workspace import BaseWorkspaceManager
+from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
 logger = logging.getLogger("harness_automation")
@@ -200,6 +200,11 @@ class ExecutionResult:
     stop_reason: Optional[str] = "complete"
     error_message: Optional[str] = None
     usage: Optional[Dict[str, Any]] = field(default=None)
+    # 本次 run_conversation 返回的原生 Hermes/OpenAI 消息列表(含 assistant.tool_calls
+    # 与 role=="tool" 结果)。Hermes 无 gateway,轨迹的工具证据只能从这里取——供
+    # trajectory.extract_tool_calls_openai 解析。self._history 只存纯文本 user/assistant
+    # 对(无 tool_calls),故整份解析天然只命中"本轮"工具调用,历史轮不贡献。
+    messages: Optional[List[Dict[str, Any]]] = field(default=None)
 
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
         data = {
@@ -208,6 +213,7 @@ class ExecutionResult:
             "stop_reason": self.stop_reason,
             "error_message": self.error_message,
             "usage": self.usage,
+            "messages": self.messages,
         }
         if update:
             data.update(update)
@@ -408,6 +414,7 @@ class HermesAgent:
                 content=final_text,
                 stop_reason=result_dict.get("stop_reason") or "complete",
                 usage=result_dict.get("usage"),
+                messages=result_dict.get("messages") or [],
             )
         finally:
             self._exit_hermes_home(handle)
@@ -581,7 +588,7 @@ class HermesWorkspaceManager(BaseWorkspaceManager):
                 if src.exists():
                     dst = workspace / _PERSONA_DST.get(config_file, Path(config_file))
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
+                    copy_path(src, dst)
                     logger.info("复制 Agent 配置: %s -> %s", config_file, dst)
                 else:
                     logger.warning("Agent 配置文件不存在: %s", src)

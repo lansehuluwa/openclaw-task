@@ -1,9 +1,15 @@
 # AI AGENT 自动化任务系统
+
+本项目是配置驱动的 AI Agent 自动化任务系统，入口统一为
+`python harness_automation.py --config <config>`，通过 `harness_type` 切换后端。
+
 一个强大的、配置驱动的自动化系统，用于编排和执行 AI Agent 任务。支持多 Agent 协作、工作空间管理、结果传递等功能。目前支持框架如下：
 - OpenClaw
 - Hermes
 - Claude-Code
-- Openjiuwen
+- JiuwenClaw
+- OpenCode
+- Codex
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -20,9 +26,24 @@
 | `from claude_agent_sdk import ClaudeSDKClient` | 需要 `claude` CLI 已安装 (`claude --version`) | `.claude/settings.json`全局兜底配置
 详见 `src/claudecode_client.py`。
 
-## Openjiuwen
+## OpenJiuwen
 > `from openjiuwen.core` | openjiuwen 要显式在白名单里选 provider client（Anthropic / OpenAI / DeepSeek...），不在白名单的字符串兜底成 OpenAI。anthropic-messages 必须写 provider: "Anthropic"| `不支持TOOLS.md, 装配 rails/tools工具说明动态生成` | `~/.openjiuwen/openjiuwen.json `全局兜底
 详见 `src/openjiuwen_client.py`。
+
+## OpenCode
+> 基于本地 OpenCode CLI 的轻量 harness，通过 `opencode run --format json` 执行任务并复用真实 session。
+| `opencode run --format json --dir <workspace>` | 需要 `opencode` CLI 已安装并已在 OpenCode 自身配置中设置可用服务 |
+详见 `src/opencode_client.py` 和 `configs/config_opencode.json`。模型、provider、endpoint 与凭证默认由 OpenCode 自身配置读取。
+
+
+## Codex
+> 基于官方 `openai-codex` Python SDK。一个 run 维护一个 `AsyncCodex`
+> app-server，每个 `(agent_name, session_name)` 维护一个真实 thread；每个 Agent
+> 使用独立模板目录，thread 在该目录下按 session 隔离 `cwd`，项目级技能放在 `.agents/skills`。
+
+Codex 直接读取部署前准备好的 `~/.codex/config.toml`。Agent 可通过
+`agents[].model` 的 `provider/model` 写法选择服务；同名 `simulator_config`
+配置优先。详见[Codex SDK 集成说明](docs/CODEX_SDK_INTEGRATION_ASSESSMENT.md)。
 
 ## 特性
 
@@ -34,13 +55,17 @@
 - ✅ **执行报告** - 自动生成详细的执行报告
 - ✅ **类型安全** - 使用 Pydantic 进行配置验证
 
+
 ## 快速开始
 
 ### 1. 安装依赖
 
 ```bash
 # 一份 requirements.txt 涵盖两个后端 (openclaw + hermes)
-pip install -r requirements.txt
+pip install -r requirements.txt # OpenClaw 2026.6.6 (8c802aa)  \ Hermes Agent v0.18.2 (2026.7.7.2) \ 2.1.22 (Claude Code)
+npm i -g opencode-ai # 1.18.18
+npm install -g @openai/codex # codex-cli 0.147.0
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent # 0.84.2
 ```
 
 ### 2. 确保 OpenClaw 运行
@@ -49,6 +74,17 @@ pip install -r requirements.txt
 # 检查 OpenClaw 状态
 curl http://127.0.0.1:18789/health
 ```
+
+#### 超时与并发（网关侧配置，长任务/长推理必读）
+
+| 配置键 | 含义 | 建议值 |
+| --- | --- | --- |
+| `models.providers.<id>.timeoutSeconds` | **LLM 请求超时**——"多久没返回会 `LLM request timed out`"。挂在 provider 上，不是 `agents.defaults.llm`（该键会被网关拒：`Unrecognized key: "llm"`） | `600`（长推理可再调大） |
+| `agents.defaults.timeoutSeconds` | agent 单轮总超时（与 harness 下发的 timeoutMs 对齐） | `7200` |
+| `agents.defaults.subagents.runTimeoutSeconds` | 子 agent 运行超时 | `7200` |
+| `agents.defaults.maxConcurrent` | 同时运行的**顶层 agent** 数；调小可降低 `session file changed ... embedded prompt lock` 会话锁冲突。|
+| `agents.defaults.subagents.maxConcurrent` | 一个 agent 能并发拉起的**子 agent** 数；做 PPT 等靠子 agent 并发的任务用的是这个，**保持高值** | `8` |
+
 
 ### 3. 创建配置文件
 
@@ -74,35 +110,40 @@ curl http://127.0.0.1:18789/health
 ### 4. 运行
 
 ```bash
-# 同一份 config.json,两个后端任挑
-python openclaw_automation.py --config configs/config_simple.json
-python hermes_automation.py   --config configs/config_simple.json
+# 同一份 config.json,多harness兼容
+python python harness_automation.py --config configs/config_simple.json --harness openclaw/hermes/claude-code/openjiuwen/opencode...
 ```
 
 ## 文档
-
-- **[快速开始](QUICKSTART.md)** - 5 分钟入门指南
-- **[设计文档](DESIGN.md)** - 详细的架构和 API 文档
-- **[示例代码](examples.py)** - 10 个实用示例
+| 文档 | 说明 |
+|---|---|
+| [OPENCODE_INTEGRATION.md](OPENCODE_INTEGRATION.md) | OpenCode 接入方式、opencode.json、workspace、skill、session |
+| [CONFIG_STRUCTURE.md](CONFIG_STRUCTURE.md) | 配置结构说明 |
+| [QUICKSTART.md](QUICKSTART.md) | 快速开始 |
+| [DESIGN.md](DESIGN.md) | 架构与设计 |
+| [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md) | 目录结构 |
+| [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) | 项目总结 |
+| [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 
 ## 项目文件
 
 | 文件 | 说明 |
 |------|------|
-| `openclaw_automation.py` | 主程序 - 核心自动化引擎 |
-| `examples.py` | 示例集合 - 10 个使用示例 |
-| `test_automation.py` | 测试脚本 - 验证系统功能 |
+| `harness_automation.py` | 主程序 - 核心自动化引擎 |
+| `configs/` | 示例集合 |
+| `test/` | 测试实例集合 |
 | `DESIGN.md` | 设计文档 - 完整的技术文档 |
 | `QUICKSTART.md` | 快速开始 - 入门指南 |
 | `README.md` | 本文件 - 项目概述 |
 
-### 配置示例
+### 基础配置示例
 
 | 文件 | 说明 |
 |------|------|
 | `example_config.json` | 完整示例 - 研究+写作流水线 |
 | `config_simple.json` | 简单示例 - 基础问答 |
-| `config_code_review.json` | 高级示例 - 代码审查流程 |
+| `config_user.json` | 调用user_simulator模型 |
+| `config_simple_eval.json` | 新增evaluator-agent |
 
 ### Hermes 端文件 (一体化新增)
 
@@ -115,9 +156,9 @@ python hermes_automation.py   --config configs/config_simple.json
 | `test/smoke_test.py` | Hermes 离线冒烟（imports / 配置校验 / 变量替换） |
 | `test/test_hermes_client.py` | Hermes 端到端: 真实拉起 AIAgent 跑一条 query |
 
-## 测试矩阵（3 Harness × 3 配置）
+## 测试矩阵（n Harness × 3 配置）
 
-系统支持 3 种 harness 后端和 3 种配置模式的自由组合，共 9 种场景。核心配置文件为：
+系统支持 n 种 harness 后端和 3 种配置模式的自由组合，共 3n 种场景。核心配置文件为：
 
 | 配置文件 | 模式 | `use_simulator` | `evaluate` |
 |----------|------|:-:|:-:|
@@ -125,31 +166,20 @@ python hermes_automation.py   --config configs/config_simple.json
 | `config_user.json` | + User Simulator | `true` | 无 |
 | `config_simple_eval.json` | + Evaluator | `true` | 有 |
 
-### 3 × 3 矩阵
+### n × 3 矩阵
 
 | | `config_simple.json` | `config_user.json` | `config_simple_eval.json` |
 |---|---|---|---|
 | **OpenClaw** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **Hermes** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 | **ClaudeCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **OpenJiuwen** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
+| **OpenCode** | 单轮问答 | 多轮 + simulator | 多轮 + simulator + evaluator |
 
 ### 运行方式
 
 ```bash
-# OpenClaw（默认 harness，不需要 --harness 参数）
-python harness_automation.py --config configs/config_simple.json
-python harness_automation.py --config configs/config_user.json
-python harness_automation.py --config configs/config_simple_eval.json
-
-# Hermes — CLI --harness 覆盖 config 内的 harness_type
-python harness_automation.py --harness hermes --config configs/config_simple.json
-python harness_automation.py --harness hermes --config configs/config_user.json
-python harness_automation.py --harness hermes --config configs/config_simple_eval.json
-
-# ClaudeCode
-python harness_automation.py --harness claudecode --config configs/config_simple.json
-python harness_automation.py --harness claudecode --config configs/config_user.json
-python harness_automation.py --harness claudecode --config configs/config_simple_eval.json
+python python harness_automation.py --config configs/config_simple.json --harness openclaw/hermes/claude-code/openjiuwen/opencode...
 ```
 
 ### 三种配置模式
@@ -167,6 +197,8 @@ python harness_automation.py --harness claudecode --config configs/config_simple
 | **OpenClaw** | 网关 `agents_update` | `provider/model`（如 `api-proxy-deepseek/deepseek-v4-flash`） | 必填 |
 | **Hermes** | `AIAgent` 构造参数 | 裸模型名（如 `deepseek-v4-flash`） | 不需要 |
 | **ClaudeCode** | 环境变量 `ANTHROPIC_MODEL` | 裸模型名 | 不需要 |
+| **OpenJiuwen** | `simulator_config[agent]`，其次 `~/.openjiuwen/openjiuwen.json` 的 `agents.<name>` 和 `default` | 裸模型名 | 可省略（默认 OpenAI）；原生 provider 需使用白名单名称 |
+| **OpenCode** | OpenCode 自身配置；可选 CLI `--model` 覆盖 | `provider/model` | 覆盖时必填 |
 
 `user_proxy_model.json` 统一调配各 agent 的模型。OpenClaw 场景需要配 `provider` 字段拼接 `provider/model`，其他 harness 忽略该字段：
 
