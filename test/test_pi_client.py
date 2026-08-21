@@ -151,13 +151,16 @@ class _FakeProcess:
         return self.returncode
 
 
-def _register(client: PiClient, workspace: Path):
+def _register(
+    client: PiClient, workspace: Path, config_dir: Path | None = None
+):
     client.register_agent_defaults(
         "agent",
         system_prompt="be brief",
         model="test-model",
         model_provider="test-provider",
         cwd=workspace,
+        config_dir=config_dir,
     )
 
 
@@ -190,7 +193,8 @@ class PiRpcLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return processes.pop(0)
 
             client = PiClient("pi-test")
-            _register(client, workspace)
+            config_dir = workspace / ".pi-agent"
+            _register(client, workspace, config_dir)
             main = client.get_agent("agent", "main")
             self.assertIs(main, client.get_agent("agent", "main"))
             other = client.get_agent("agent", "other")
@@ -212,6 +216,9 @@ class PiRpcLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first.tool_calls[0].output, "wrote answer.txt")
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0][1]["cwd"], str(workspace / ".sessions" / "main"))
+            self.assertEqual(
+                calls[0][1]["env"]["PI_CODING_AGENT_DIR"], str(config_dir)
+            )
             self.assertIn("--approve", calls[0][0])
             self.assertIn("--append-system-prompt", calls[0][0])
             self.assertTrue((workspace / ".sessions/main/INPUT.md").is_file())
@@ -311,7 +318,13 @@ class PiWorkspaceAndConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             client = PiClient()
             workspace_manager = PiWorkspaceManager(temp_dir)
-            override = AgentModelConfig(model="model-b", provider="provider-b")
+            override = AgentModelConfig(
+                model="model-b",
+                provider="provider-b",
+                base_url="https://provider-b.example/v1",
+                api_key="plain-text-key",
+                api="openai-completions",
+            )
             manager = PiAgentManager(
                 client, workspace_manager, {"main": override}
             )
@@ -324,6 +337,23 @@ class PiWorkspaceAndConfigTests(unittest.TestCase):
             defaults = client._agent_defaults["main"]
             self.assertEqual(defaults.model, "model-b")
             self.assertEqual(defaults.model_provider, "provider-b")
+            self.assertEqual(defaults.config_dir, Path(temp_dir) / "main/.pi-agent")
+            models_config = json.loads(
+                (defaults.config_dir / "models.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                models_config,
+                {
+                    "providers": {
+                        "provider-b": {
+                            "baseUrl": "https://provider-b.example/v1",
+                            "api": "openai-completions",
+                            "models": [{"id": "model-b"}],
+                            "apiKey": "plain-text-key",
+                        }
+                    }
+                },
+            )
 
     def test_three_shared_configs_use_fixed_pi_workspace(self):
         config_names = (

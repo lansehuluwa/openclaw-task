@@ -2,7 +2,7 @@
 
 每个 ``(agent_name, session_name)`` 维护一个长期运行的
 ``pi --mode rpc --no-session`` 子进程，通过 stdin/stdout JSONL 协议交互。
-Pi CLI、模型和明文密钥均由部署阶段预先配置。
+Pi CLI 由部署阶段预装；模型和明文密钥可来自 Pi 配置或项目 simulator_config。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -88,6 +89,7 @@ class _AgentDefaults:
     model: Optional[str]
     model_provider: Optional[str]
     cwd: Path
+    config_dir: Optional[Path] = None
 
 
 def _content_text(content: Any) -> str:
@@ -197,12 +199,19 @@ class PiAgent:
                 ["--append-system-prompt", self._defaults.system_prompt]
             )
 
+        process_env = None
+        if self._defaults.config_dir is not None:
+            # 每个 Agent 使用自己的 Pi 配置目录，避免不同测试模型互相覆盖。
+            process_env = os.environ.copy()
+            process_env["PI_CODING_AGENT_DIR"] = str(self._defaults.config_dir)
+
         process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(session_cwd),
+            env=process_env,
             limit=_RPC_STREAM_LIMIT,
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
@@ -498,6 +507,7 @@ class PiClient:
         model: Optional[str],
         model_provider: Optional[str],
         cwd: Path,
+        config_dir: Optional[Path] = None,
     ) -> None:
         """注册一个 Agent 的系统提示词、模型和 workspace 模板。"""
 
@@ -506,6 +516,7 @@ class PiClient:
             model=model,
             model_provider=model_provider,
             cwd=cwd,
+            config_dir=config_dir,
         )
 
     def get_agent(self, agent_name: str, session_name: str) -> PiAgent:
@@ -524,7 +535,7 @@ class PiClient:
 
 
 async def build_pi_client(pi_command: str = "pi") -> PiClient:
-    """使用部署阶段已经预装并配置好的 Pi CLI。"""
+    """使用部署阶段已经预装好的 Pi CLI。"""
     return PiClient(pi_command)
 
 
@@ -635,12 +646,34 @@ class PiAgentManager:
         if model_provider is None and model and "/" in model:
             model_provider, model = model.split("/", 1)
         workspace = self.workspace_manager.get_agent_workspace(agent_name)
+        config_dir = None
+        if override and override.base_url and model_provider and model:
+            # 将测试配置直接转换为 Pi models.json；明文服务地址和密钥按原值写入。
+            config_dir = workspace / ".pi-agent"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            provider_config: Dict[str, Any] = {
+                "baseUrl": override.base_url,
+                "api": override.api or "openai-completions",
+                "models": [{"id": model}],
+            }
+            if override.api_key:
+                provider_config["apiKey"] = override.api_key
+            (config_dir / "models.json").write_text(
+                json.dumps(
+                    {"providers": {model_provider: provider_config}},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         self.client.register_agent_defaults(
             agent_name,
             system_prompt=agent_config.system_prompt,
             model=model,
             model_provider=model_provider,
             cwd=workspace,
+            config_dir=config_dir,
         )
         logger.info(
             "设置 Pi Agent: %s | provider=%s model=%s workspace=%s",
