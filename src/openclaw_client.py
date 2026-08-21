@@ -43,6 +43,7 @@ logger = logging.getLogger("harness_automation")
 
 DEFAULT_GATEWAY_TIMEOUT_SECONDS = 3600
 GATEWAY_CONNECT_GRACE_SECONDS = 30.0
+_SDK_CLIENT_TIMEOUT_MAX = 3600
 
 _BACKOFF_INITIAL = 1.0
 _BACKOFF_MAX = 60.0
@@ -367,7 +368,8 @@ async def build_openclaw_client(
         mode="protocol" if gateway_ws_url else "auto",
         gateway_ws_url=gateway_ws_url,
         api_key=api_key,
-        timeout=int(timeout),
+        # SDK 对 timeout 有 3600 硬上限,超限直接 ValidationError
+        timeout=int(min(timeout, _SDK_CLIENT_TIMEOUT_MAX)),
     )
     gateway = ResilientGateway(
         ws_url=gateway_ws_url or "ws://127.0.0.1:18789/gateway",
@@ -695,25 +697,18 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                     "Agent returned empty content and chat.history had no new assistant reply"
                 )
             except AgentExecutionError as e:
-                # 网关侧 error/lifecycle 事件被 SDK 包成 AgentExecutionError 抛出,典型为:
-                #   - "LLM request timed out"                          (LLM 单请求超时)
-                #   - "session file changed while embedded prompt lock  (会话锁冲突)
-                #      was released"
                 msg = str(e).lower()
-                if "message or attachment required" in msg:
-                    # 确定性非法请求,重试救不了,快速失败(与下方连接分支一致)
-                    logger.error("网关拒绝非法请求(非连接问题),快速失败不重试: %s", e)
-                    raise
-                if "llm request timed out" in msg or "request timed out" in msg:
-                    reason = "LLM 请求超时"
-                elif "session file changed" in msg or "embedded prompt lock" in msg:
-                    reason = "会话锁冲突(session file changed while embedded prompt lock)"
+                if "llm request failed" in msg:
+                    reason = "llm request failed"
                 else:
-                    reason = "agent 执行异常"
+                    # 其它 AgentExecutionError 直接上抛,不重试
+                    logger.error("AgentExecutionError,直接上抛: %s", e)
+                    raise
                 logger.warning(
                     "%s (第 %d/%d 次): %s，先查 history 看旧 run 是否已完成",
                     reason, attempt, max_attempts, e,
                 )
+                await asyncio.sleep(60)
                 fallback_text = await history_fallback(before_history)
                 if fallback_text:
                     logger.info("%s但 agent 已完成,从 history 获取到回复", reason)
@@ -725,6 +720,18 @@ def make_openclaw_execute_with_retry(client: OpenClawClient):
                 if attempt >= max_attempts:
                     logger.error("%s且 history 无兜底,已达最大重试次数 %d", reason, max_attempts)
                     raise
+                # llm request failed: 等待后发送"继续"提示 agent 恢复执行
+                logger.warning(
+                    "llm request failed,第 %d/%d 次重试发送'继续'提示 agent 恢复",
+                    attempt, max_attempts,
+                )
+                try:
+                    result = await agent.execute("继续", options=options)
+                    if result is not None and getattr(result, "content", None):
+                        logger.info("'继续'重试成功,agent 恢复执行")
+                        return result, True
+                except Exception as retry_e:
+                    logger.warning("'继续'重试也失败: %s", retry_e)
                 logger.warning(
                     "history 也无结果,第 %d/%d 次重试前等待 %d 秒",
                     attempt, max_attempts, EXECUTION_RETRY_WAIT_SECONDS,

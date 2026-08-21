@@ -1,13 +1,14 @@
 """
 OpenCode CLI 子进程客户端封装。
 
-每个 ``execute()`` 启动一个 ``opencode run --format json`` 子进程：
+核心设计: 一个 ``(agent_name, session_name)`` 对应一个持久化 OpenCode 会话。
+首次 ``execute()`` 启动 ``opencode run`` 子进程并记录 sessionID;后续 ``execute()``
+通过 ``--session <id>`` 续接同一会话,不重复启动新进程。
 
-- ``--dir <agent workspace>``：每个 Agent 独立工作区，技能基于该工作区；
-- ``--agent <agent>``：由 opencode.json 中定义的 Agent 决定模型/技能；
-- ``--session <id>``：续接 OpenCode 真实会话（首轮自动记录 sessionID）。
+进程异常退出时(如 LLM 请求失败导致子进程崩溃),``execute_with_retry`` 会重建进程
+并续接 sessionID,与 openclaw_client.py 的 gateway 重连模式对齐。
 
-公开 API（与 hermes/claudecode 等 harness 对齐,供 harness_automation 统一装配）:
+公开 API(与 hermes/claudecode 等 harness 对齐,供 harness_automation 统一装配):
   OpenCodeClient / OpenCodeAgent / ExecutionResult / ExecutionOptions / OpenCodeError
   build_opencode_client()
   OpenCodeWorkspaceManager / OpenCodeAgentManager
@@ -34,8 +35,6 @@ logger = logging.getLogger("harness_automation")
 
 EXECUTION_MAX_ATTEMPTS = 5
 EXECUTION_RETRY_WAIT_SECONDS = 60
-
-_CREATE_NO_WINDOW = 0x08000000
 _ERROR_TEXT_LIMIT = 4000
 
 
@@ -50,6 +49,7 @@ class ExecutionResult:
     stop_reason: Optional[str] = "complete"
     error_message: Optional[str] = None
     usage: Optional[Dict[str, Any]] = field(default=None)
+    messages: Optional[List[Dict[str, Any]]] = field(default=None)
 
     def model_copy(self, *, update: Optional[Dict[str, Any]] = None) -> "ExecutionResult":
         data = {
@@ -57,7 +57,8 @@ class ExecutionResult:
             "content": self.content,
             "stop_reason": self.stop_reason,
             "error_message": self.error_message,
-            "usage": self.usage
+            "usage": self.usage,
+            "messages": self.messages,
         }
         if update:
             data.update(update)
@@ -110,6 +111,7 @@ def _event_error_message(event: Dict[str, Any]) -> Optional[str]:
         return None
     return _redact_error_text(str(value))
 
+
 def _parse_run_output(stdout: str) -> Dict[str, Any]:
     """解析 ``opencode run --format json`` 的逐行 JSON 事件。"""
     session_id: Optional[str] = None
@@ -148,7 +150,6 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
                 part_id = str(part.get("id") or f"event-{index}")
                 if part_id not in text_by_part:
                     text_order.append(part_id)
-                # 同一 part 可能输出多次累计快照，保留最后一份。
                 text_by_part[part_id] = text
         elif event_type == "tool":
             # v1.x tool part 形如 {type:"tool", tool:<name>, callID:<id>,
@@ -179,9 +180,6 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
                 "tokens": tokens if isinstance(tokens, dict) else {},
                 "cost": part.get("cost"),
             }
-            # v1.18 实测 step-finish part.reason:正常结束为 "stop";
-            # 其余(如 "length" 达到 maxTokens)原样透传,供下游把
-            # 非 complete 的轮次标为"证据可能不完整"(对齐其他 harness)。
             reason = part.get("reason")
             if isinstance(reason, str) and reason:
                 stop_reason = "complete" if reason == "stop" else reason
@@ -193,18 +191,45 @@ def _parse_run_output(stdout: str) -> Dict[str, Any]:
     if stdout.strip() and valid_events == 0 and not errors:
         errors.append("OpenCode 未返回合法 JSON 事件")
 
+    content = "".join(text_by_part[key] for key in text_order).strip()
+
+    messages: List[Dict[str, Any]] = []
+    messages.append({"role": "assistant", "content": content})
+    for call_id in tool_order:
+        tc = tool_by_id[call_id]
+        messages.append({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": tc["id"],
+                "function": {
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["input"], ensure_ascii=False) if tc["input"] else "",
+                },
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": str(tc["output"]) if tc["output"] else "",
+        })
+
     return {
-        "content": "".join(text_by_part[key] for key in text_order).strip(),
+        "content": content,
         "session_id": session_id,
         "tool_calls": [tool_by_id[key] for key in tool_order],
         "usage": usage,
         "stop_reason": stop_reason or "complete",
         "error": "; ".join(errors) if errors else None,
+        "messages": messages,
     }
 
 
 class OpenCodeAgent:
-    """一个 ``(agent_name, session_name)`` 对应的 OpenCode 会话句柄。"""
+    """一个 ``(agent_name, session_name)`` 对应的 OpenCode 会话句柄。
+
+    首次 execute 启动子进程,记录 sessionID;后续 execute 通过 --session 续接。
+    进程崩溃后,execute_with_retry 会重新调用 execute 重建进程(续接 sessionID)。
+    """
 
     def __init__(
         self,
@@ -217,7 +242,6 @@ class OpenCodeAgent:
         self._client = client
         self.agent_name = agent_name
         self.session_name = session_name
-        self.session_id = session_name
         self.session_key = session_name
         self._workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self._model_override = model_override
@@ -253,38 +277,16 @@ class OpenCodeAgent:
     ) -> None:
         if process.returncode is not None:
             return
-
-        if os.name == "nt":
-            try:
-                killer = await asyncio.create_subprocess_exec(
-                    "taskkill",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    creationflags=_CREATE_NO_WINDOW,
-                )
-                try:
-                    await asyncio.wait_for(killer.communicate(), timeout=5)
-                except asyncio.TimeoutError:
-                    killer.kill()
-                    await killer.wait()
-            except Exception as exc:
-                logger.debug("taskkill 失败，回退 process.kill(): %s", exc)
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-
+        # Linux: kill 整个进程组 (start_new_session=True 创建的)
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
         if process.returncode is None:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -312,12 +314,8 @@ class OpenCodeAgent:
         self._workspace.mkdir(parents=True, exist_ok=True)
         command = self._build_command()
         prompt = query.encode("utf-8")
-        subprocess_kwargs: Dict[str, Any] = {}
-        if os.name == "nt":
-            subprocess_kwargs["creationflags"] = _CREATE_NO_WINDOW
-        else:
-            subprocess_kwargs["start_new_session"] = True
 
+        # start_new_session=True: 创建独立进程组,便于用 os.killpg 清理子进程树
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -325,7 +323,7 @@ class OpenCodeAgent:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._workspace),
-                **subprocess_kwargs,
+                start_new_session=True,
             )
         except Exception as exc:
             return ExecutionResult(
@@ -390,13 +388,15 @@ class OpenCodeAgent:
                 content=parsed["content"],
                 stop_reason="error",
                 error_message=error,
-                usage=parsed["usage"]
+                usage=parsed["usage"],
+                messages=parsed.get("messages"),
             )
         return ExecutionResult(
             success=True,
             content=parsed["content"],
             stop_reason=parsed["stop_reason"],
-            usage=parsed["usage"]
+            usage=parsed["usage"],
+            messages=parsed.get("messages"),
         )
 
 
@@ -411,6 +411,7 @@ class OpenCodeClient:
         self.command = command
         self._agent_overrides: Dict[str, AgentModelConfig] = agent_overrides or {}
         self._agents: Dict[tuple, OpenCodeAgent] = {}
+        self.workspace_manager: Optional[OpenCodeWorkspaceManager] = None
 
     async def __aenter__(self) -> "OpenCodeClient":
         return self
@@ -496,6 +497,7 @@ class OpenCodeWorkspaceManager(BaseWorkspaceManager):
                     logger.warning("Agent 配置文件不存在: %s", src)
         else:
             logger.warning("Agent 源目录不存在: %s", agent_source)
+
 
 class OpenCodeAgentManager:
     """OpenCode Agent 管理器：确保每个 Agent 的独立 workspace 存在。"""

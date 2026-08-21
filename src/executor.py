@@ -37,6 +37,9 @@ EXECUTION_HISTORY_FALLBACK_LIMIT = 50
 EXECUTION_HISTORY_FALLBACK_MAX_POLLS = 40
 EXECUTION_HISTORY_FALLBACK_POLL_INTERVAL_SECONDS = 30.0
 
+# 后台检测轮询参数
+BG_WATCH_INTERVAL = 60.0   # 轮询间隔(秒)
+BG_WATCH_TIMEOUT = 600  # 单轮兜底超时(秒);正常路径靠 stopReason 全收敛
 
 def _replace_variables(text: str, results: Dict[str, Any]) -> str:
     pattern = r'\{result_(\w+)\}'
@@ -52,23 +55,86 @@ def _replace_variables(text: str, results: Dict[str, Any]) -> str:
 
     return re.sub(pattern, replacer, text)
 
+def _gateway_of(agent):
+    """取被测 agent 挂载的 openclaw 网关;非 openclaw(hirms/cc)返回 None。"""
+    return getattr(getattr(agent, "_client", None), "gateway", None)
 
-async def _safe_chat_history(agent) -> List[dict[str, Any]]:
-    """安全拉取被测 agent 会话历史(失败降级为空,绝不中断主流程)。
 
-    仅 OpenClaw client 提供 `gateway.chat_history`;Hermes/Claudecode 无 gateway,
-    直接返回空(其 ExecutionResult 自带完整历史,不需要此 fallback)。
-    """
-    gateway = getattr(getattr(agent, "_client", None), "gateway", None)
+async def _safe_chat_history(agent, session_key: Optional[str] = None) -> List[dict[str, Any]]:
+    """安全拉取被测 agent 会话历史(失败降级为空,绝不中断主流程)。"""
+    gateway = _gateway_of(agent)
     if gateway is None:
         return []
     try:
         return await gateway.chat_history(
-            agent.session_key, limit=EXECUTION_HISTORY_FALLBACK_LIMIT
+            session_key or agent.session_key, limit=EXECUTION_HISTORY_FALLBACK_LIMIT
         )
     except Exception as e:  # noqa: BLE001
         logger.debug("chat_history 采集失败: %s", e)
         return []
+
+
+async def _check_child_session_done(
+    gateway: Any, child_key: str,
+) -> tuple[bool, str]:
+    """直接查子代理自身的 session history,判断其是否已结束执行。
+
+    判定逻辑:取子会话 history 的最后一条 assistant 消息,检查其 stopReason 字段。
+    stopReason=="stop" 表示子代理已产出最终回复、执行结束。
+    stopReason=="toolUse" 表示还在调工具、尚未结束。
+
+    Returns:
+        (is_done, reason) — is_done=True 时 reason 描述判定依据。
+    """
+    if gateway is None:
+        return False, "no gateway"
+    try:
+        child_history = await gateway.chat_history(child_key, limit=10)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[子代理直查] %s history 获取失败: %s", child_key, e)
+        return False, f"history error: {e}"
+
+    if not child_history:
+        return False, "empty history"
+
+    # 找最后一条 assistant 消息
+    last_asst = None
+    for msg in reversed(child_history):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "assistant":
+            continue
+        last_asst = msg
+        break
+
+    if last_asst is None:
+        return False, "no assistant message"
+
+    stop_reason = str(last_asst.get("stopReason", "")).lower()
+    if stop_reason == "stop":
+        return True, "stopReason=stop"
+    if stop_reason in ("tooluse", "tool_use", "tool_use"):
+        return False, f"stopReason={stop_reason} (still using tools)"
+    if stop_reason:
+        return False, f"stopReason={stop_reason} (not conclusive)"
+
+    # 没有 stopReason 字段:降级为旧逻辑——有文本就算完成
+    content = last_asst.get("content")
+    text = ""
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        parts: List[str] = []
+        for b in content:
+            if isinstance(b, dict):
+                v = b.get("text") or b.get("content")
+                if isinstance(v, str):
+                    parts.append(v)
+        text = "".join(parts).strip()
+    if text:
+        return True, "no stopReason but last assistant msg has text"
+    return False, "no stopReason and no text"
+
 
 def _new_messages_since(
     before: List[dict[str, Any]], after: List[dict[str, Any]]
@@ -85,6 +151,320 @@ def _new_messages_since(
         m for m in after
         if isinstance(m, dict) and m.get("timestamp", 0) > before_max_ts
     ]
+
+
+def _latest_assistant_text(messages: List[dict[str, Any]]) -> str:
+    """从消息列表取最后一条 assistant 的纯文本(content 可能是 str 或 block 列表)。"""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            parts: List[str] = []
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                v = b.get("text") or b.get("content")
+                if isinstance(v, str):
+                    parts.append(v)
+            text = "".join(parts).strip()
+        else:
+            t = msg.get("text")
+            text = t.strip() if isinstance(t, str) else ""
+        if text:
+            return text
+    return ""
+
+
+import json as _json
+
+
+def _extract_spawned_child_keys(new_msgs: List[dict[str, Any]]) -> List[str]:
+    """从本轮 execute 新增消息中,提取 sessions_spawn 工具返回的 childSessionKey 集合。
+
+    JSONL 结构:role=toolResult, toolName=sessions_spawn, content 是 JSON 文本或
+    block 列表,里面含 "childSessionKey": "agent:main:subagent:<uuid>"。
+    """
+    keys: List[str] = []
+    for msg in new_msgs:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "toolresult":
+            continue
+        tn = str(msg.get("toolName") or msg.get("tool_name") or "").lower()
+        if tn != "sessions_spawn":
+            continue
+        # content 可能是 str 或 block 列表,块里 text 是 JSON 文本
+        content = msg.get("content")
+        raw_texts: List[str] = []
+        if isinstance(content, str):
+            raw_texts.append(content)
+        elif isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict):
+                    v = b.get("text") or b.get("content")
+                    if isinstance(v, str):
+                        raw_texts.append(v)
+        # 也兼容 details.childSessionKey 直接字段
+        details = msg.get("details")
+        if isinstance(details, dict):
+            k = details.get("childSessionKey")
+            if isinstance(k, str) and k:
+                keys.append(k)
+        for txt in raw_texts:
+            try:
+                d = _json.loads(txt)
+            except Exception:
+                continue
+            if isinstance(d, dict):
+                k = d.get("childSessionKey")
+                if isinstance(k, str) and k:
+                    keys.append(k)
+    # 去重保序
+    seen = set()
+    uniq = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq
+
+
+def _extract_completed_child_keys(new_msgs: List[dict[str, Any]]) -> List[str]:
+    """从消息中提取"子代理完成事件"里对应的 session_key。
+
+    Openclaw 把子代理完成通知作为 role=user 消息注入父会话,内容含
+    `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>` 和 `session_key: <key>`。
+    """
+    keys: List[str] = []
+    for msg in new_msgs:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "user":
+            continue
+        c = msg.get("content")
+        txt = c if isinstance(c, str) else ""
+        if not txt and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    txt += b["text"]
+        if "Internal task completion event" not in txt:
+            continue
+        # 抓 "session_key: agent:main:subagent:<uuid>"
+        m = re.search(r"session_key\s*:\s*(agent:[^\s]+)", txt)
+        if m:
+            keys.append(m.group(1).strip())
+    return keys
+
+
+def _is_placeholder_message(msg: dict[str, Any]) -> bool:
+    """判断一条消息是否属于"不该视为父 agent 真实交付"的占位/内部事件。
+
+    覆盖(全部跳过):
+      1. cli echo (api=cli 的 assistant 重放)
+      2. sessions_yield 回执 (customType=openclaw.sessions_yield / content 含标记)
+      3. 子代理 completion event (role=user + Internal task completion event)
+      4. heartbeat poll (role=user + 内容 "[OpenClaw heartbeat poll]")
+      5. NO_REPLY 占位
+      6. 只含 tool_use/toolCall 块、无文本的 assistant 消息(非交付)
+    """
+    if not isinstance(msg, dict):
+        return False
+    role = str(msg.get("role", "")).lower()
+    api = str(msg.get("api", "")).lower()
+    ctype = str(msg.get("customType") or msg.get("custom_type") or "").lower()
+    c = msg.get("content")
+    txt = c if isinstance(c, str) else ""
+    if not txt and isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and isinstance(b.get("text"), str):
+                txt += b["text"]
+    if txt.strip() == "NO_REPLY":
+        return True
+    if role == "assistant" and api == "cli":
+        return True
+    if "sessions_yield" in ctype:
+        return True
+    if "previous turn ended intentionally via sessions_yield" in txt:
+        return True
+    if role == "user" and "Internal task completion event" in txt:
+        return True
+    if role == "user" and "OpenClaw heartbeat poll" in txt:
+        return True
+    # assistant 只带 toolCall/tool_use 块、无任何文本 → 非交付
+    if role == "assistant" and isinstance(c, list):
+        has_text = any(
+            isinstance(b, dict) and isinstance(b.get("text"), str) and b["text"].strip()
+            for b in c
+        )
+        only_tools = all(
+            isinstance(b, dict) and b.get("type") in ("toolCall", "tool_use", "thinking")
+            for b in c
+        )
+        if not has_text and only_tools:
+            return True
+    return False
+
+
+def _latest_deliverable_text(messages: List[dict[str, Any]]) -> str:
+    """取最后一条真实"父 agent 交付"文本:跳过 _is_placeholder_message 命中的所有占位。"""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() != "assistant":
+            continue
+        if _is_placeholder_message(msg):
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            text = c.strip()
+        elif isinstance(c, list):
+            parts: List[str] = []
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                v = b.get("text") or b.get("content")
+                if isinstance(v, str):
+                    parts.append(v)
+            text = "".join(parts).strip()
+        else:
+            t = msg.get("text")
+            text = t.strip() if isinstance(t, str) else ""
+        if text:
+            return text
+    return ""
+
+
+async def _collect_spawned_children(
+    agent, before_history: List[dict[str, Any]] = None,
+) -> List[str]:
+    """本轮 execute 新增的子代理 spawn childSessionKey 集合。
+
+    只看本轮 execute 相对 before_history 的增量消息里,role=toolResult 且
+    toolName=sessions_spawn 返回的 childSessionKey。无 gateway 返回空。
+    """
+    gateway = _gateway_of(agent)
+    if gateway is None:
+        return []
+    after_history = await _safe_chat_history(agent)
+    new_msgs = _new_messages_since(before_history or [], after_history)
+    keys = _extract_spawned_child_keys(new_msgs)
+    if keys:
+        logger.info("[后台检测] 本轮 spawn %d 个子代理: %s", len(keys), keys)
+    return keys
+
+
+# 后台观察返回状态
+BG_NEW_CONTENT = "new_content"      # 拿到子代理全部完成后的父 agent 真实交付
+BG_TIMEOUT = "timeout"              # 到达 timeout 或子代理进程失效,提前退出
+
+
+async def _background_watch(
+    agent,
+    before_history: List[dict[str, Any]],
+    pending_children: List[str],
+) -> tuple[str, str]:
+    """后台监测:轮询等待 spawn 的所有子代理都完成,才返回父 agent 的真实交付。
+
+    完成判定分两个信号,任一命中即算该子代理完成:
+
+      **信号1 (completion event)**: 父会话 chat_history 增量中出现 role=user 的
+      "[Internal task completion event]",从中提取 session_key 匹配。
+
+      **信号2 (子代理 history 直查 stopReason)**: 直接调 gateway.chat_history(child_key)
+      stopReason=="stop" → 子代理已产出最终回复、执行结束。
+
+    **嵌套 spawn 追踪**: 每轮轮询还扫描父会话增量里的新 spawn(childSessionKey),
+      加入 pending。这覆盖"child1 完成后父 agent 立即 spawn child2"的嵌套场景——
+      bg-watch 不会因 pending 暂时清空就提前返回中间产物。
+
+    每轮轮询顺序:
+      1. 父 chat_history 增量:completion event → 移除;新 spawn → 加入 pending
+      2. 子代理 history 直查 stopReason:最后一条 assistant 的 stopReason=="stop" → 移除
+      3. pending 全部清空且本轮无新 spawn → 取父 agent 真实交付
+      4. 到 max_polls(BG_WATCH_TIMEOUT)兜底 → BG_TIMEOUT
+
+    期间所有"中间产物"(cli echo / yield 回执 / heartbeat / 部分子代理完成)都不算
+    交付、不触发下一轮交互,因此不占用 max_turn。
+    """
+    parent_key = agent.session_key
+    gateway = _gateway_of(agent)
+
+    # 基线:execute 之后的当前 history,后续轮询用 _new_messages_since 取增量
+    base_history = await _safe_chat_history(agent, parent_key)
+
+    pending = set(pending_children)
+    max_polls = max(1, int(BG_WATCH_TIMEOUT // BG_WATCH_INTERVAL))
+
+    for poll in range(1, max_polls + 1):
+        await asyncio.sleep(BG_WATCH_INTERVAL)
+
+        # 1. 扫描父会话增量:completion event 移除 + 新 spawn 加入 pending
+        after_history = await _safe_chat_history(agent, parent_key)
+        new_msgs = _new_messages_since(base_history, after_history)
+        if new_msgs:
+            # 1a. 辅助信号:completion event 中的 session_key → 移除
+            completed = _extract_completed_child_keys(new_msgs)
+            for k in completed:
+                if k in pending:
+                    pending.discard(k)
+                    logger.info(
+                        "[后台检测] 子代理 %s 完成 (via completion event),剩余 %d 个",
+                        k, len(pending),
+                    )
+            # 1b. 嵌套 spawn:增量里新出现的 childSessionKey → 加入 pending
+            new_spawns = _extract_spawned_child_keys(new_msgs)
+            for k in new_spawns:
+                if k not in pending:
+                    pending.add(k)
+                    logger.info(
+                        "[后台检测] 嵌套 spawn 检测到新子代理 %s,加入 pending"
+                        "(剩余 %d 个)",
+                        k, len(pending),
+                    )
+            # 增量已处理,推进基线
+            base_history = after_history
+
+        # 2. 主信号:直查子代理 session history 的 stopReason
+        #    取最后一条 assistant 消息,stopReason=="stop" → 已产出最终回复
+        if gateway and pending:
+            for k in list(pending):
+                is_done, reason = await _check_child_session_done(gateway, k)
+                if is_done:
+                    pending.discard(k)
+                    logger.info(
+                        "[后台检测] 子代理 %s 完成 (via child history: %s),剩余 %d 个",
+                        k, reason, len(pending),
+                    )
+
+        # 3. 全部子代理完成且本轮无新 spawn → 取父 agent 真实交付
+        if not pending:
+            full_history = await _safe_chat_history(agent, parent_key)
+            text = _latest_deliverable_text(full_history)
+            if text:
+                logger.info(
+                    "[后台检测] 全部 %d 个子代理完成,取到父 agent 交付"
+                    "(等待约 %.0fs)",
+                    len(pending_children), poll * BG_WATCH_INTERVAL,
+                )
+                return BG_NEW_CONTENT, text
+            # 全部完成但父 agent 交付尚未落盘,继续等下一轮(父可能在综合)
+
+        logger.debug(
+            "[后台检测] 第 %d/%d 次轮询,未完成子代理 %d 个: %s",
+            poll, max_polls, len(pending), sorted(pending),
+        )
+
+    logger.info(
+        "[后台检测] 等待约 %.0fs 仍未等到全部子代理完成(剩余 %d 个),超时兜底",
+        max_polls * BG_WATCH_INTERVAL, len(pending),
+    )
+    return BG_TIMEOUT, ""
+
 
 async def process_turn(
     client: Any,
@@ -177,6 +557,7 @@ async def process_turn(
     if evaluator.to_simulator and ev is not None and ev.task_declared_complete:
         return evaluator.format_feedback(ev)
     return None
+
 
 async def execute_queries(
     queries: List[QueryItem],
@@ -288,13 +669,47 @@ async def execute_queries(
             if query_simulator is None:
                 success = True
                 break
-            
+            # 后台监测: 扫描本轮增量消息，从 sessions_spawn 里提取 childSessionKey
+            # 等全部子代理都完成(completion event 收齐)后才进入下一轮真实对话。
+            #   - 全部完成 → 取父 agent 最终交付给 S,清空待完成集合,正常走本轮
+            #   - 超时/子代理进程失效 → 兜底,注入系统提示促 simulator 追问
+            bg_notice = ""
+            newly_spawned = await _collect_spawned_children(agent, before_history)
+            # pending_children 挂在 agent 上跨轮持久,覆盖"上一轮未完成的子代理超时未完成"的情况
+            pending_children: set = getattr(agent, "_bg_pending_children", None) or set()
+            pending_children.update(newly_spawned)
+
+            if pending_children:
+                logger.info(
+                    "[后台检测] 待完成子代理 %d 个(turn=%d): %s",
+                    len(pending_children), turn, sorted(pending_children),
+                )
+                bg_status, bg_text = await _background_watch(
+                    agent, before_history, list(pending_children),
+                )
+                if bg_status == BG_NEW_CONTENT and bg_text:
+                    # 全部子代理完成,父 agent 已综合交付 → 本轮真实交付
+                    agent_reply = bg_text
+                    result = result.model_copy(update={"content": bg_text})
+                    last_result = result
+                    logger.info("[A%d·后台交付] %s", turn, agent_reply)
+                    pending_children.clear()
+                else:
+                    # 超时兜底:未完成子代理保留在 pending,带入下一轮继续追踪
+                    wait_min = int(BG_WATCH_TIMEOUT // 60) or 1
+                    bg_notice = (
+                        f"\n\n【系统提示】后台子代理长时间未全部完成,"
+                        f"已等待约 {wait_min} 分钟。请向对方确认后台任务实际进展,"
+                        "或要求其给出当前已完成的结果。"
+                    )
+            agent._bg_pending_children = pending_children  # 空集也回写,确保状态一致
+
             evaluator_feedback = await process_turn(
                 client, query, turn, current_query, result, evidence_incomplete,
                 trajectory, evaluator, agent=agent, before_history=before_history,
             )
 
-            user_reply = query_simulator.chat(agent_reply, evaluator_feedback=evaluator_feedback)
+            user_reply = query_simulator.chat(agent_reply + bg_notice, evaluator_feedback=evaluator_feedback)
             logger.debug("[S%d] %s", turn, user_reply)
 
             # 空 user_reply 绝不能原样作为下一轮 current_query 下发给网关
@@ -346,42 +761,38 @@ async def execute_queries(
 
 
 def _make_options(timeout: int):
-    """构造 ExecutionOptions — 延迟导入避免循环依赖"""
-    try:
-        from openclaw_sdk import ExecutionOptions
-        # openclaw-sdk 2.1.0: SDK 的 ExecutionOptions.timeout_seconds 被 pydantic 约束为 le=3600
-        opts = ExecutionOptions()
+    """构造 ExecutionOptions — 延迟导入避免循环依赖。"""
+    # (module, attr) 优先级序列;openclaw_sdk 在前,带 3600 上限绕过
+    candidates = [
+        ("openclaw_sdk", "ExecutionOptions"),
+        ("src.hermes_client", "ExecutionOptions"),
+        ("src.claudecode_client", "ExecutionOptions"),
+        ("src.openjiuwen_client", "ExecutionOptions"),
+        ("src.opencode_client", "ExecutionOptions"),
+        ("src.codex_client", "ExecutionOptions"),
+    ]
+    for mod_path, cls_name in candidates:
         try:
-            object.__setattr__(opts, "timeout_seconds", int(timeout))
-        except Exception:
-            # 兜底: 极少数 pydantic 冻结模型下 __setattr__ 失败,退回子类重声明字段
-            from pydantic import Field
-            class _UnboundedExecutionOptions(ExecutionOptions):
-                timeout_seconds: int = Field(default=300, ge=1)
-            opts = _UnboundedExecutionOptions(timeout_seconds=int(timeout))
-        if timeout > 3600:
-            logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
-        return opts
-    except ImportError:
-        pass
-    try:
-        from src.hermes_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.claudecode_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.openjiuwen_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
-    try:
-        from src.opencode_client import ExecutionOptions
-        return ExecutionOptions(timeout_seconds=timeout)
-    except ImportError:
-        pass
+            mod = __import__(mod_path, fromlist=[cls_name])
+            Cls = getattr(mod, cls_name)
+        except ImportError:
+            continue
+
+        # openclaw_sdk: pydantic 约束 le=3600,需绕过
+        if mod_path == "openclaw_sdk":
+            opts = Cls()
+            try:
+                object.__setattr__(opts, "timeout_seconds", int(timeout))
+            except Exception:
+                from pydantic import Field
+                class _Unbounded(Cls):
+                    timeout_seconds: int = Field(default=300, ge=1)
+                opts = _Unbounded(timeout_seconds=int(timeout))
+            if timeout > 3600:
+                logger.info("openclaw: 已绕过 SDK 3600 上限,向网关下发单次超时 %ds", timeout)
+            return opts
+
+        # 其余 harness:简单 dataclass,直接构造
+        return Cls(timeout_seconds=timeout)
+
     return None

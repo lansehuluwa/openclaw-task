@@ -105,8 +105,14 @@ class BaseWorkspaceManager(ABC):
             else:
                 logger.warning("用户内容目录不存在或不是目录: %s", root_path)
 
-    def setup_from_map(self, map_file: str, base_dir: Optional[str] = None) -> None:
-        """根据 map.json 按映射逐条复制文件/目录"""
+    def setup_from_map(
+        self,
+        map_file: str,
+        base_dir: Optional[str] = None,
+        agent_name: str = "main",
+    ) -> None:
+        """根据 map.json 按映射逐条复制文件/目录
+        目标路径里的 "~" 解析为 **执行 agent 的 workspace**,"""
         map_path = Path(map_file)
         if not map_path.exists():
             logger.warning("map 文件不存在: %s", map_path)
@@ -114,13 +120,23 @@ class BaseWorkspaceManager(ABC):
 
         mapping: Dict[str, str] = json.loads(map_path.read_text(encoding="utf-8"))
         base = Path(base_dir) if base_dir else None
+        agent_ws = self.get_agent_workspace(agent_name)
         logger.info("读取 map 文件: %s,共 %d 条映射", map_path, len(mapping))
+        logger.info("目标 workspace(~) [agent=%s]: %s", agent_name, agent_ws)
         if base:
             logger.info("源路径基准目录: %s", base)
 
         for src_str, dst_str in mapping.items():
             src = (base / src_str) if base else Path(src_str).expanduser()
-            dst = Path(dst_str).expanduser()
+
+            # "~" 解析为该 agent 的 workspace;其余按绝对路径直接复制
+            s = dst_str.strip()
+            if s == "~":
+                dst = agent_ws
+            elif s.startswith("~/") or s.startswith("~\\"):
+                dst = agent_ws / s[2:]
+            else:
+                dst = Path(s)
 
             if not src.exists():
                 logger.warning("源路径不存在,跳过: %s", src)
@@ -135,4 +151,4 @@ class BaseWorkspaceManager(ABC):
             else:
                 shutil.copy2(src, dst)
 
-            logger.info("映射复制: %s -> %s", src_str, dst_str)
+            logger.info("映射复制: %s -> %s", src_str, dst)
