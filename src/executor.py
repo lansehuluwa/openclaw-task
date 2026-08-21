@@ -29,7 +29,7 @@ from src.evaluator.trajectory import (
     extract_tool_calls_openai,
 )
 # 后台监测机制(子代理 spawn 完成检测 + 真实交付提取)
-from bg_watch import (
+from src.bg_watch import (
     BG_NEW_CONTENT,
     BG_TIMEOUT,
     BG_WATCH_INTERVAL,
