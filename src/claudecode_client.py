@@ -196,12 +196,12 @@ class ClaudecodeAgent:
         self._lock = asyncio.Lock()
 
     def _build_options(self) -> ClaudeAgentOptions:
-        mcp_servers: Dict[str, Any] = {
-            "playwright": {
+        mcp_servers: Dict[str, Any] = {}
+        if os.environ.get("MCP_PLAYWRIGHT", "off") == "on":
+            mcp_servers["playwright"] = {
                 "command": "npx",
                 "args": ["@playwright/mcp@latest", "--browser", "chromium"],
-            },
-        }
+            }
         if os.environ.get("IMAGE_READING", "off") == "on":
             image_reading_path = os.environ.get("IMAGE_READING_PATH")
             if image_reading_path:
