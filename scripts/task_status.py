@@ -46,6 +46,8 @@ from scripts.harness_adapter import get_adapter, HarnessAdapter
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
 RUN_LOG_PATH = "/home/ma-user/workspace/workdir/run.log"
+# Windows 沙箱 (config system.platform == "windows"): 用户目录 C:\Users\win11admin
+WIN_RUN_LOG_PATH = r"C:\Users\win11admin\workspace\workdir\run.log"
 EVALUATOR_USE_LOG = LOGS_DIR / "evaluator_use.log"
 
 # ============================================================================
@@ -439,6 +441,11 @@ def compute_task_status(
     adapter = get_adapter(harness_type, task_config=task_config)
 
     run_log = RUN_LOG_PATH
+    # 平台分支: system.platform 决定沙箱路径 (windows 用户目录 C:\Users\win11admin,
+    # linux 默认 /home/ma-user)。不加 _IS_WINDOWS 布尔, 直接用字符串 == 比较。
+    platform = ((task_config.get("system") or {}).get("platform")) or []
+    if "windows" in platform:
+        run_log = WIN_RUN_LOG_PATH
     task_done = has_task_done_marker(run_log)
     # evaluator 裁决: evaluator_use.log 为主, run.log 兜底, 再兜底 evaluator 轨迹
     has_eval, score, verdict_source = resolve_first_verdict(

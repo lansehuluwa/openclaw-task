@@ -200,6 +200,10 @@ def build_model(config: AgentModelConfig, *, timeout: float, max_tokens: int) ->
         "api_base": base_url,
         "verify_ssl": base_url.lower().startswith("https://"),
         "timeout": timeout,
+        # 流式请求由 SDK 逐 chunk 用 wait_for 驱动,idle 超时默认 60s 会在
+        # 慢网关 / 长推理静默期误杀，first_chunk 不得超过整体 timeout,否则传输层会先于应用层超时。
+        "stream_idle_timeout": None,
+        "stream_first_chunk_timeout": None
     }
     return Model(
         model_client_config=ModelClientConfig(**client_config),
