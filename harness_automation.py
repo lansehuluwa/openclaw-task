@@ -8,6 +8,7 @@
 - openjiuwen
 - opencode
 - codex
+- jiuwenswarm
 - pi agent
 - grok
 - deepseek harness(dsh)
@@ -185,6 +186,14 @@ class HarnessAutomation:
         elif self.harness_type == "dsh":
             from src.dsh_client import DshWorkspaceManager
             self.workspace_manager = DshWorkspaceManager("~/.dsh/workspace")
+        elif self.harness_type == "jiuwenswarm":
+            from src.jiuwenswarm_client import (
+                JiuwenSwarmWorkspaceManager,
+                resolve_jiuwenswarm_workspace_root,
+            )
+            self.workspace_manager = JiuwenSwarmWorkspaceManager(
+                str(resolve_jiuwenswarm_workspace_root())
+            )
         else:
             from src.openclaw_client import OpenclawWorkspaceManager
             self.workspace_manager = OpenclawWorkspaceManager("~/.openclaw/workspace")
@@ -211,6 +220,8 @@ class HarnessAutomation:
             return await self._run_grok()
         elif self.harness_type == "dsh":
             return await self._run_dsh()
+        elif self.harness_type == "jiuwenswarm":
+            return await self._run_jiuwenswarm()
         else:
             return await self._run_openclaw()
 
@@ -549,6 +560,35 @@ class HarnessAutomation:
                 run_id=_RUN_ID,
             )
             return results
+
+    async def _run_jiuwenswarm(self) -> Dict[str, Any]:
+        from src.jiuwenswarm_client import (
+            build_jiuwenswarm_client,
+            execute_jiuwenswarm,
+            make_jiuwenswarm_get_agent,
+        )
+        from src.executor import execute_queries
+
+        async with await build_jiuwenswarm_client(self.workspace_manager) as client:
+            self.client = client
+            await self._setup_workspaces()
+            for agent_config in self.config.agents:
+                client.setup_agent(agent_config, self.agent_overrides.get(agent_config.name))
+            evaluator_names = {
+                q.evaluate.agent_name for q in self.config.queries if q.evaluate is not None
+            }
+            return await execute_queries(
+                queries=self.config.queries,
+                client=client,
+                get_agent_fn=make_jiuwenswarm_get_agent(client, evaluator_names),
+                execute_with_retry_fn=execute_jiuwenswarm,
+                simulator_factory=lambda: create_simulator(self.config, self.simulator_model_cfg),
+                agent_system_prompts={
+                    a.name: a.system_prompt for a in self.config.agents if a.system_prompt
+                },
+                max_turn=self.config.user_max_turn,
+                run_id=_RUN_ID,
+            )
 
     async def _setup_workspaces(self) -> None:
         """设置工作空间"""
