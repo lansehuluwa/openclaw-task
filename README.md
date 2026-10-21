@@ -12,6 +12,7 @@
 - Codex
 - Pi
 - DeepSeek Harness (DSH)
+- JiuwenSwarm（TUI 协议）
 
 ## OpenClaw 
 > 基于 openclaw-sdk 的配置驱动任务编排框架
@@ -31,6 +32,13 @@
 ## OpenJiuwen
 > `from openjiuwen.core` | openjiuwen 要显式在白名单里选 provider client（Anthropic / OpenAI / DeepSeek...），不在白名单的字符串兜底成 OpenAI。anthropic-messages 必须写 provider: "Anthropic"| `不支持TOOLS.md, 装配 rails/tools工具说明动态生成` | `~/.openjiuwen/openjiuwen.json `全局兜底
 详见 `src/openjiuwen_client.py`。
+
+## JiuwenSwarm（TUI 协议）
+
+通过官方 CLI 同款 `/tui` WebSocket 协议接入，使用 `--harness jiuwenswarm` 选择。
+复用公共任务编排、工作区、模拟用户和评估器，无需新增项目依赖。
+先在 JiuwenSwarm 原生配置中设置自己的服务地址、密钥和模型，再通过 `agents[].model` 为不同任务选择模型别名或 ID；网关地址与执行模式通过环境变量设置。
+部署、手动测试及适用限制见 [JiuwenSwarm 集成说明](docs/JIUWENSWARM_INTEGRATION.md)。
 
 ## OpenCode
 > 基于本地 OpenCode CLI 的轻量 harness，通过 `opencode run --format json` 执行任务并复用真实 session。
@@ -105,6 +113,7 @@ npm i -g opencode-ai # 1.18.18
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent # pi 0.84.3
 npm install -g @xai-official/grok # grok build 1.0.5
 npx @deepseek-ai/dsh # dsh 0.1.1-rc.2 (deepseek-harness-sdk==0.1.1rc1)
+jiuwenswarm-init # jiuwenswarm 初始化
 ```
 
 ### 2. 确保 OpenClaw 运行

@@ -3,7 +3,8 @@ openclaw-sdk==2.1.0
 aiohttp
 
 # hermes harness
-pydantic>=2,<3
+pydantic==2.13.4
+certifi==2026.5.20
 openai>=1.0
 httpx>=0.27
 pyyaml
@@ -12,10 +13,8 @@ hermes-agent==0.18.2
 # claude-code harness
 claude-agent-sdk==0.2.144
 
-# openjiuwen
-opentelemetry-sdk==1.44.0
-openjiuwen==0.1.17.post1
-anthropic==0.120.2
+# jiuwenswarm
+workswarm==0.2.7
 
 # codex
 openai-codex==0.147.0

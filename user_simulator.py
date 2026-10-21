@@ -14,6 +14,7 @@ log_dir.mkdir(exist_ok=True)
 _handler = logging.FileHandler(log_dir / "api_use.log", encoding="utf-8")
 _handler.setFormatter(logging.Formatter("%(message)s"))
 api_logger.addHandler(_handler)
+api_logger.propagate = False  # 只落 api_use.log, 不冒泡到 root 打印到控制台(同 evaluator_use)
 
 PROMPT_FILE = Path(__file__).parent / "system_prompt.md"
 
