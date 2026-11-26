@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 from user_simulator import User_simulator
 
 from src.config import AutomationConfig, ConfigLoader, load_agent_model_configs
+from src.agent_logging import install_log_filter, register_secrets
 from scripts.task_status import run_stats
 
 import time as _time
@@ -45,6 +46,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger("harness_automation")
     logger.setLevel(logging.DEBUG)
+    install_log_filter()
 
     if logger.handlers:
         return logger
@@ -61,7 +63,7 @@ def setup_logger(config_file: Optional[str] = None) -> logging.Logger:
     fh.setLevel(logging.DEBUG)
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
+    ch.setLevel(logging.INFO)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(fmt)
@@ -160,6 +162,7 @@ class HarnessAutomation:
         self.harness_type = config.harness_type
         # 从 simulator_config JSON 一次加载全部:{"user_simulator": AgentModelConfig, "<agent>": ...}
         all_cfgs = load_agent_model_configs(config.simulator_config)
+        register_secrets(all_cfgs)
         # user_simulator 段单独取出给 create_simulator 用;剩下的按 agent_name 传给 harness
         self.simulator_model_cfg = all_cfgs.pop("user_simulator", None)
         self.agent_overrides = all_cfgs

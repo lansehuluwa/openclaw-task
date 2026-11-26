@@ -8,10 +8,11 @@
 - OpenClaw Local（本地 CLI）
 - Hermes
 - Claude-Code
-- JiuwenClaw
+- OpenJiuwen（JiuwenClaw）
 - OpenCode
 - Codex
 - Pi
+- Grok
 - DeepSeek Harness (DSH)
 - JiuwenSwarm（TUI 协议）
 
@@ -19,6 +20,41 @@
 ## 模型 API 转发网关
 
 网关基于 llm-proxy-lite，可按端口转发模型 API 请求，并将会话和响应记录写入小时 JSONL 文件。[配置与使用说明](llm_proxy_lite/PROXY_GATEWAY.md)
+
+## Agent 日志
+
+各接入共用执行摘要格式，包含后端、Agent、会话和调用序号。控制台默认只输出 INFO 及以上；SDK 原始消息、工具参数、完整结果和异常堆栈写入原生诊断文件。日志中的已知配置密钥及常见 Bearer、`sk-` 凭据会脱敏。
+
+```text
+[pi agent=main session=main_20261125T170000 call=1] 开始执行 timeout=300秒
+[pi agent=main session=main_20261125T170000 call=1] 工具开始 tool=terminal 参数=command
+[pi agent=main session=main_20261125T170000 call=1] 工具失败 tool=terminal 耗时=0.25秒 原因=退出码=1
+[pi agent=main session=main_20261125T170000 call=1] 执行完成 耗时=3.20秒 工具完成=2 工具失败=1 工具无结果=0
+```
+
+工具失败后，Agent 可以换用其他方法继续执行；最终执行结果仍按后端返回的状态判断。没有工具结果时标记“无结果”，不补造成功记录。SDK 支持情况如下：
+
+| 接入 | 工具日志来源 |
+| --- | --- |
+| Hermes、Claude Code、Pi | 执行过程中的工具开始和结束事件 |
+| JiuwenSwarm dev / xiaoyi | TUI 工具调用和结果事件 |
+| Codex、DSH、Grok、OpenClaw Local / TUI | 返回结果中已有的工具记录，完成后汇总 |
+| OpenCode | CLI JSON 事件解析后汇总，保留工具错误状态 |
+| OpenJiuwen | SDK 流事件保存为诊断，返回的工具消息汇总显示 |
+| OpenClaw WebSocket | 执行及历史兜底结果汇总；后台未返回的工具事件仍需查 OpenClaw 服务日志 |
+
+日志位置：
+
+- 默认主日志：项目目录下 `logs/<配置文件名>.log`，保留 `[Q]`、`[A]` 等现有结果标识。
+- 各接入诊断：任务工作目录下 `logs/agents/<后端>/<agent>/<session>.log`。
+- Hermes 兼容原路径：任务工作目录下 `logs/hermes/<agent>/<session>.log`。
+- 网关日志：网关启动目录下 `logs_proxy/gateway.log` 和 `logs_proxy/traj/`，与 Agent 主日志分别保存。
+
+本地复现入口可能另行指定主日志路径；以启动时打印的路径为准。直连模型时没有本项目网关轨迹；经网关时应使用稳定 `session-id` 关联请求。网关内部尝试不会逐条复制进 Agent 主日志，客户端感知到的错误仍由各接入记录。
+
+Hermes 对参数、认证等不可重试的 4xx 停止整任务重试。已观察到的工具参数顶层均为 `object`、上游仍报 Schema 400 的情况，仅在当前模型请求边界恢复一次，保留已执行的工具结果。其他后端保留原有重试策略。
+
+日志相关回归已在本地执行，测试脚本不随本次改动提交。这些回归不调用真实模型；各 SDK、CLI 和远程服务的版本兼容性仍需在对应运行环境验证。`cache/`、`logs/` 和 `logs_proxy/` 属于本地产物，不提交任务密钥或复现轨迹。
 
 ## 镜像管理
 1. openclaw-tui: 

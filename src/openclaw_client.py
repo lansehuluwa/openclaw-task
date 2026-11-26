@@ -35,6 +35,8 @@ from openclaw_sdk.gateway.protocol import ProtocolGateway
 from src.workspace import BaseWorkspaceManager, copy_path
 from src.config import AgentModelConfig, warn_agent_model_conflict
 
+from src.agent_logging import logged_execution
+
 logger = logging.getLogger("harness_automation")
 
 # ============================================================================
@@ -570,6 +572,7 @@ async def openclaw_check_readyz(client: OpenClawClient) -> None:
 def make_openclaw_execute_with_retry(client: OpenClawClient):
     """返回 openclaw 专用的 execute_with_retry 闭包 (含 history fallback + gateway 重连)"""
 
+    @logged_execution("openclaw")
     async def execute_with_retry(agent, query_text: str, options):
         max_attempts = EXECUTION_MAX_ATTEMPTS
 

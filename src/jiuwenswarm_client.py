@@ -25,6 +25,8 @@ from src.config import warn_agent_model_conflict
 from src.opencode_client import ExecutionOptions, ExecutionResult, _redact_error_text
 from src.workspace import BaseWorkspaceManager, copy_path
 
+from src.agent_logging import logged_execution, log_native, log_tool_start, log_tool_complete
+
 logger = logging.getLogger("harness_automation")
 
 EXECUTION_MAX_ATTEMPTS = 5
@@ -336,6 +338,7 @@ class JiuwenSwarmAgent:
         """
         while True:
             frame = await ws.receive_json()
+            log_native("TUI消息", frame)
             if frame.get("type") != "res" or frame.get("id") != request_id:
                 continue
             if frame.get("ok") is False:
@@ -391,6 +394,7 @@ class JiuwenSwarmAgent:
             self.session_key,
         )
 
+    @logged_execution("jiuwenswarm")
     async def execute(self, query: str, options: ExecutionOptions = None) -> ExecutionResult:
         timeout = getattr(options, "timeout_seconds", None) or 3600
         # 每轮使用独立连接；服务端仍可能转发同会话上一轮的尾随事件。
@@ -443,8 +447,10 @@ class JiuwenSwarmAgent:
         usage = None
         mode = self._client.mode
         team_mode = mode.startswith("team") or mode in ("code.team", "agent.team")
+        active_tools = {}
         while True:
             frame = await ws.receive_json()
+            log_native("TUI事件", frame)
             if frame.get("type") == "res":
                 if frame.get("ok") is False:
                     raise RuntimeError(str(frame.get("error") or frame.get("payload")))
@@ -482,6 +488,11 @@ class JiuwenSwarmAgent:
             elif event == "chat.tool_call":
                 tool = payload.get("tool_call") or payload
                 arguments = tool.get("arguments", tool.get("input", {}))
+                call_id = tool.get("tool_call_id") or tool.get("call_id") or tool.get("id")
+                if call_id not in active_tools:
+                    name = tool.get("tool_name") or tool.get("name") or "unknown"
+                    active_tools[call_id] = (name, arguments)
+                    log_tool_start(call_id, name, arguments)
                 messages.append({"role": "assistant", "tool_calls": [{
                     "id": tool.get("tool_call_id") or tool.get("call_id") or tool.get("id"),
                     "function": {
@@ -492,6 +503,9 @@ class JiuwenSwarmAgent:
             elif event == "chat.tool_result":
                 tool_result = payload.get("tool_result")
                 tool_result = tool_result if isinstance(tool_result, dict) else payload
+                call_id = tool_result.get("tool_call_id") or tool_result.get("call_id") or tool_result.get("id")
+                name, arguments = active_tools.pop(call_id, ("unknown", {}))
+                log_tool_complete(call_id, name, arguments, tool_result)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_result.get("tool_call_id") or tool_result.get("call_id") or tool_result.get("id"),

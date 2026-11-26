@@ -39,7 +39,16 @@ python llm_proxy_lite/app.py --config llm_proxy_lite/proxy_config.json
 
 ## 日志文件与统计
 
+控制台按请求输出摘要，包含供应商、`session`、`request`、客户端与上游状态、尝试次数、耗时和 Token 用量。模型请求成功显示 INFO；真实失败或恢复过的请求显示 WARNING，并保留尝试次数。逐次尝试的细节写入 `logs_proxy/gateway.log`，控制台不重复打印访问日志。
+
+`/api/tags`、`/api/show`、`/props`、模型列表等能力探测，以及 `/hi` 健康检查，只输出 DEBUG，并在 JSONL 中分别标记 `request_kind=probe/health`。404 仍保留其实际状态，不计入模型调用统计。模型请求标记为 `model`，其他转发标记为 `http`。旧索引没有该字段时沿用原有统计口径。
+
+SSE 的成功按协议结束事件判断：OpenAI Chat 的 `finish_reason`、Anthropic 的 `message_stop` 或 Responses 的 `response.completed`。如果响应已正常结束，客户端随后关闭连接，则记录 `client_closed_after_completion=true` 并保留成功；缺少结束事件、真正中断、上游 HTTP 错误或 SSE 错误仍记录失败。取消时也解析已转发的事件，保留 Token 和结束状态。
+
+Agent 端与网关端的日志分别保存。网关内部失败不会逐条同步到 Agent 主日志；流式接口返回给客户端的 HTTP 状态也可能与上游不同，应同时看 `success`、`error`、`upstream_status_code` 和 `stream_completed`。
+
 ```text
+logs_proxy/gateway.log
 logs_proxy/traj/
 ├── index.jsonl
 └── data/
@@ -61,8 +70,8 @@ logs_proxy/traj/
 
 | 位置 | 字段 |
 | --- | --- |
-| 数据行 | `ts` 为本地时间，格式是 `YYYYMMDDHHmmssSSS`。`id` 为请求标识，`session-id` 为会话标识。`provider`、`protocol`、`method` 和 `path` 记录供应商、协议、请求方法和含查询参数的路径。`headers` 和 `req` 保存客户端请求，`res` 保存响应状态、头部、会话标识、响应内容和可用的 SSE 事件。 |
-| 索引行 | `file` 相对于 `logs_proxy/traj/`，`offset` 是起始字节，`length` 是包括换行的字节长度。`model`、`tok_in`、`tok_out` 和 `success` 支持按模型和状态汇总。模型请求进入转发逻辑后，`total_attempts` 记录实际尝试次数。 |
+| 数据行 | `ts` 为本地时间，格式是 `YYYYMMDDHHmmssSSS`。`id` 为请求标识，`session-id` 为会话标识。`provider`、`protocol`、`method` 和 `path` 记录供应商、协议、请求方法和含查询参数的路径。`headers` 和 `req` 保存客户端请求，`res` 保存响应状态、头部、会话标识、响应内容和可用的 SSE 事件。`request_kind` 区分请求类型，`duration_ms` 为耗时。 |
+| 索引行 | `file` 相对于 `logs_proxy/traj/`，`offset` 是起始字节，`length` 是包括换行的字节长度。`model`、`tok_in`、`tok_out` 和 `success` 支持按模型和状态汇总。`request_kind` 和 `duration_ms` 与数据行一致。模型请求进入转发逻辑后，`total_attempts` 记录实际尝试次数。 |
 
 网关将 `logs_proxy/traj/` 写在启动时的工作目录下。运行统计脚本前，先切换到启动网关时所在的目录，即使使用脚本的绝对路径也是如此。以下命令适用于从项目根目录启动的情况。也可访问网关监听地址的 `/statistic`。统计脚本支持按模型、日期和成败筛选，也能读取 Lite 旧版索引。
 
